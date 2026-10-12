@@ -9136,6 +9136,9 @@ function renderHabitsBlock(plugin, occs, day, today, view) {
 function renderRoutineCard(plugin, occ, view) {
   const state = routineCardState(occ);
   const routine = occ.routine;
+  const expanded = view && view.routineExpanded instanceof Set ? view.routineExpanded : null;
+  const occurrenceKey = JSON.stringify([routine.path, occ.day]);
+  let open = expanded ? expanded.has(occurrenceKey) : true;
   const card = document.createElement('div');
   card.className = `iplan-card iplan-routine is-${routine.routineType}`;
   card.setAttribute('data-routine', routine.path);
@@ -9165,10 +9168,41 @@ function renderRoutineCard(plugin, occ, view) {
   card.appendChild(meta);
   card.appendChild(title);
 
+  const steps = expanded ? document.createElement('div') : card;
+  if (expanded) {
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'iplan-card-sub-toggle';
+    const chevron = document.createElement('span');
+    chevron.className = 'iplan-card-sub-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    toggle.appendChild(chevron);
+    meta.insertBefore(toggle, kind);
+    card.appendChild(steps);
+    const paint = () => {
+      const label = `${open ? 'Hide' : 'Show'} steps of ${routine.name} on ${occ.day}`;
+      toggle.title = label;
+      toggle.setAttribute('aria-label', label);
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      setIcon(chevron, open ? 'chevron-down' : 'chevron-right');
+      steps.hidden = !open;
+    };
+    toggle.addEventListener('pointerdown', (event) => event.stopPropagation());
+    toggle.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      open = !open;
+      if (open) expanded.add(occurrenceKey);
+      else expanded.delete(occurrenceKey);
+      paint();
+    });
+    paint();
+  }
+
   const model = checklistModel({
     rows: occ.steps.map((s) => ({ id: s.index, label: s.label, checked: s.done, disabled: state.ghost })),
   });
-  renderChecklist(card, model, {
+  renderChecklist(steps, model, {
     ariaLabel: `${routine.name}, ${routineKicker(occ).toLowerCase()} steps`,
     onToggle: (id, next) => plugin.toggleRoutineStep(routine.path, occ.day, Number(id), next, occ.total),
     onProgress: (done, total) => card.classList.toggle('is-done', total > 0 && done === total),
@@ -9871,6 +9905,7 @@ class PlannerBoardView extends ItemView {
     this.day = todayStr();
     this.index = null;          // buildItemIndex, per render
     this.expanded = new Set();  // parent paths whose subtask list is open
+    this.routineExpanded = new Set();
   }
 
   getViewType() { return BOARD_VIEW_TYPE; }

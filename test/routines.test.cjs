@@ -12,6 +12,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 const T = require('./harness.cjs');
 
 const FM = {
@@ -303,12 +304,142 @@ test('the routines folder derives from the planner folder and is created with th
   assert.ok(/await mk\(p\.routines\);/.test(main), 'ensureFolders creates Routines/');
 });
 
+function routineCardFixture() {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const renderer = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('  getViewType()', main.indexOf('class PlannerBoardView extends ItemView')));
+  const setMode = main.slice(main.indexOf('  setMode(mode) {', main.indexOf('class PlannerBoardView extends ItemView')), main.indexOf('  render() {', main.indexOf('class PlannerBoardView extends ItemView')));
+  const element = (tagName) => {
+    const node = { tagName, children: [], attributes: {}, listeners: {}, className: '', hidden: false };
+    node.classList = {
+      add: (name) => { if (!node.className.split(' ').includes(name)) node.className += ` ${name}`; },
+      toggle: (name, enabled) => {
+        node.className = node.className.split(' ').filter((value) => value !== name).join(' ');
+        if (enabled) node.classList.add(name);
+      },
+    };
+    node.setAttribute = (name, value) => { node.attributes[name] = value; };
+    node.appendChild = (child) => { node.children.push(child); return child; };
+    node.insertBefore = (child, before) => { node.children.splice(node.children.indexOf(before), 0, child); };
+    node.addEventListener = (name, listener) => { node.listeners[name] = listener; };
+    node.fire = (name) => {
+      const event = {
+        defaultPrevented: false, stopped: false,
+        preventDefault() { this.defaultPrevented = true; },
+        stopPropagation() { this.stopped = true; },
+      };
+      node.listeners[name](event);
+      return event;
+    };
+    return node;
+  };
+  return vm.runInNewContext(`${renderer}\n${board}\n${setMode}\n}\n({ renderRoutineCard, PlannerBoardView })`, {
+    Set, ItemView: class {}, document: { createElement: element },
+    todayStr: () => '2026-09-07', mondayOf: () => '2026-09-07',
+    routineCardState: T.routineCardState, routineKicker: T.routineKicker,
+    routineTimeLabel: T.routineTimeLabel, checklistModel: T.checklistModel,
+    setIcon: (node, icon) => { node.icon = icon; },
+    renderChecklist: (parent, model, options) => { parent.checklist = { model, options }; },
+    wireLongPress: () => {},
+  });
+}
+
+test('SIMULATED: board routines start collapsed and the button paints both toggle states', () => {
+  const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
+  const view = new PlannerBoardView(null, {});
+  const occ = T.routineOccurrence(routine(), '2026-09-07', '13:00');
+  const card = renderRoutineCard({}, occ, view);
+  const toggle = card.children[0].children[0];
+  const steps = card.children[2];
+  const key = JSON.stringify([occ.routine.path, occ.day]);
+  assert.equal(toggle.tagName, 'button');
+  assert.equal(toggle.type, 'button');
+  assert.equal(steps.checklist.model.rows.length, 3);
+  for (const open of [false, true, false]) {
+    if (open || view.routineExpanded.has(key)) {
+      const event = toggle.fire('click');
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(event.stopped, true);
+    }
+    assert.equal(steps.hidden, !open);
+    assert.equal(toggle.attributes['aria-expanded'], String(open));
+    assert.equal(toggle.children[0].icon, open ? 'chevron-down' : 'chevron-right');
+    assert.equal(toggle.children[0].attributes['aria-hidden'], 'true');
+    const label = `${open ? 'Hide' : 'Show'} steps of Morning launch on 2026-09-07`;
+    assert.equal(toggle.attributes['aria-label'], label);
+    assert.equal(toggle.title, label);
+    assert.equal(view.routineExpanded.has(key), open);
+  }
+  assert.equal(toggle.fire('pointerdown').stopped, true);
+});
+
+test('SIMULATED: expansion belongs to one routine occurrence, not another date or routine', () => {
+  const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
+  const view = new PlannerBoardView(null, {});
+  const first = T.routineOccurrence(routine(), '2026-09-07', '13:00');
+  renderRoutineCard({}, first, view).children[0].children[0].fire('click');
+  const otherDay = T.routineOccurrence(routine(), '2026-09-08', '13:00');
+  const otherRoutine = T.routineOccurrence(routine({ name: 'Other routine' }, null, '02 Planner/Routines/Other.md'), first.day, '13:00');
+  for (const occ of [first, otherDay, otherRoutine]) {
+    assert.equal(renderRoutineCard({}, occ, view).children[2].hidden, occ !== first);
+  }
+  const freshView = new PlannerBoardView(null, {});
+  assert.equal(renderRoutineCard({}, first, freshView).children[2].hidden, true);
+  assert.equal(view.routineExpanded.size, 1);
+});
+
+test('SIMULATED: mode changes and step callbacks retain expansion; AGENDA has no collapse control', async () => {
+  const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
+  let body = BODY;
+  let card;
+  const calls = [];
+  const day = '2026-09-07';
+  const plugin = {
+    toggleRoutineStep(routinePath, occurrenceDay, index, next, total) {
+      calls.push([routinePath, occurrenceDay, index, next, total]);
+      body = T.routineLogAfterStep(body, occurrenceDay, index, next, total);
+      view.render();
+    },
+  };
+  const view = new PlannerBoardView(null, plugin);
+  view.render = () => { card = renderRoutineCard(plugin, T.routineOccurrence(routine({}, body), day, '13:00'), view); };
+  view.render();
+  card.children[0].children[0].fire('click');
+  const expanded = view.routineExpanded;
+  for (const mode of ['day', 'week']) {
+    view.setMode(mode);
+    assert.equal(view.mode, mode);
+    assert.equal(view.routineExpanded, expanded);
+    assert.equal(card.children[2].hidden, false);
+    assert.equal(card.children[0].children[0].attributes['aria-expanded'], 'true');
+    await card.children[2].checklist.options.onToggle('1', mode === 'day');
+    assert.equal(card.children[2].checklist.model.rows[0].checked, mode === 'day');
+    assert.equal(card.children[2].hidden, false);
+    assert.equal(card.children[0].children[0].children[0].icon, 'chevron-down');
+  }
+  assert.deepEqual(calls, [
+    ['02 Planner/Routines/Morning launch.md', day, 1, true, 3],
+    ['02 Planner/Routines/Morning launch.md', day, 1, false, 3],
+  ]);
+  card.children[0].children[0].fire('click');
+  const agenda = renderRoutineCard(plugin, T.routineOccurrence(routine({}, body), day, '13:00'), null);
+  assert.equal(agenda.hidden, false);
+  assert.equal(agenda.children.length, 2);
+  assert.equal(agenda.children[0].children[0].tagName, 'span');
+  assert.equal(agenda.checklist.model.rows.length, 3);
+  assert.equal(view.routineExpanded.size, 0);
+});
+
 test('SOURCE: the card is not draggable, the drop line counts it as a position, sync never pushes for it', () => {
   const main = fs.readFileSync(T.__mainPath, 'utf8');
   const card = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
   assert.ok(/card\.draggable = false;/.test(card), 'card must match /card\.draggable = false;/');
   assert.ok(!/dragstart/.test(card), 'no drag handler on a routine card');
-  assert.ok(/renderChecklist\(card, model/.test(card), 'the steps are the shared checklist');
+  assert.ok(/renderChecklist\(steps, model/.test(card), 'the steps container receives the shared checklist');
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
+  assert.ok(/const isDay = this\.mode === 'day';/.test(board), 'week and day share the board render method');
+  assert.ok(/const visibleDays = isDay\s*\? \[this\.day\]\s*: weekDays\(this\.weekStart\)/.test(board), 'mode selects the days, not a different routine renderer');
+  assert.ok(/renderRoutineCard\(this\.plugin, entry\.occ, this\)/.test(board), 'both modes pass the same board expansion state');
   // the drop-line selector treats a routine block as a position, ghost or not
   assert.ok(/querySelectorAll\('\.iplan-event, \.iplan-card\.iplan-routine, \.iplan-card:not\(\.is-dragging\):not\(\.is-ghost\)'\)/.test(main), 'main must match /querySelectorAll\(\'\.iplan-event, \.iplan-card\.iplan-routine, \.iplan-card:not\(\.is-dragging\):not\(\.is-ghost\)\'\)/');
   // the push check is never scheduled for a routine note. The guard gained a
