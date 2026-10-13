@@ -1855,9 +1855,8 @@ async function todoistFetchOpen(settings, deps) {
           description: (t.description || '').replace(/\s+$/, ''),
           due: t.due && t.due.date ? String(t.due.date).slice(0, 10) : null,
           priority: todoistPriorityRank(t.priority),
-          // v1 returns no url field (verified in the cockpit 2026-06-03);
-          // the app deep link is constructed from the id.
-          url: t.url || `https://app.todoist.com/app/task/${encodeURIComponent(String(t.id))}`,
+          // Planner task links always open in the Todoist desktop app.
+          url: `todoist://task?id=${encodeURIComponent(String(t.id))}`,
           tags: Array.isArray(t.labels) ? t.labels : [],
           status: null,
           // The recurrence flag on the Due object is named `is_recurring` in

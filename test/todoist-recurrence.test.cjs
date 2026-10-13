@@ -224,3 +224,19 @@ test('the sync loop decides completion through syncCompletionPlan, nowhere else'
   // And the fetch reads both spellings of the Todoist recurrence flag.
   assert.match(code, /t\.due\.is_recurring \|\| t\.due\.recurring/, 'both api/v1 field names must be read');
 });
+
+test('Todoist task links use the desktop app URI even when the API supplies a web URL', async () => {
+  const tasks = [
+    { id: '123', content: 'No API URL' },
+    { id: '456', content: 'API URL present', url: 'https://app.todoist.com/app/task/456' },
+  ];
+  const result = await T.todoistFetchOpen({ todoistToken: 'test-token' }, {
+    requestUrl: async () => ({ status: 200, json: { results: tasks, next_cursor: null } }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.items.map((item) => item.url), [
+    'todoist://task?id=123',
+    'todoist://task?id=456',
+  ]);
+});
