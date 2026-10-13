@@ -1182,6 +1182,102 @@ function laneSequence(laneEvents, cell, routines) {
   return seq.sort((a, b) => (a.plannedOrder - b.plannedOrder) || (LANE_KIND_RANK[a.kind] - LANE_KIND_RANK[b.kind]));
 }
 
+const PLANNER_SLOT_MINUTES = 30;
+const PLANNER_DEFAULT_DURATION = 60;
+const PLANNER_PIXELS_PER_MINUTE = 1;
+
+function plannedStartMinute(value) {
+  const match = /^(?:[01]\d|2[0-3]):(00|30)$/.exec(String(value == null ? '' : value));
+  return match ? Number(match[0].slice(0, 2)) * 60 + Number(match[1]) : null;
+}
+
+function plannedDuration(value) {
+  return Number.isInteger(value) && value >= PLANNER_SLOT_MINUTES && value % PLANNER_SLOT_MINUTES === 0
+    ? value : null;
+}
+
+function validPlannerDay(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) === value;
+}
+
+function isOccurrenceTracked(item) {
+  return !!item && item.source !== MANUAL_SOURCE && item.recurring !== false;
+}
+
+function completeTimedPlacement(item) {
+  if (!item || !validPlannerDay(item.plannedDay)) return null;
+  const start = plannedStartMinute(item.plannedStart);
+  const duration = plannedDuration(item.plannedDuration);
+  if (start == null || duration == null || start + duration > 1440) return null;
+  return { day: item.plannedDay, start, duration, end: start + duration };
+}
+
+function activeTimedPlacement(item) {
+  const placement = completeTimedPlacement(item);
+  if (!placement) return null;
+  if (isOccurrenceTracked(item)
+    && (!validPlannerDay(item.due) || item.plannedOccurrenceDue !== item.due)) return null;
+  return placement;
+}
+
+function snapPlannerMinute(value) {
+  const minute = Math.max(0, Math.min(1439, Number(value) || 0));
+  return Math.floor(minute / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES;
+}
+
+function clampPlannedDuration(start, value) {
+  const max = Math.floor((1440 - start) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES;
+  const requested = plannedDuration(value) || PLANNER_DEFAULT_DURATION;
+  return Math.min(max, Math.max(PLANNER_SLOT_MINUTES, requested));
+}
+
+function plannedStartText(minute) {
+  return `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+}
+
+function timedGridBounds(dayStart, dayEnd, entries) {
+  const first = Number.isInteger(dayStart) ? dayStart : 480;
+  const last = Number.isInteger(dayEnd) && dayEnd > first ? dayEnd : 1080;
+  const starts = [first, ...(entries || []).map((entry) => entry.start)];
+  const ends = [last, ...(entries || []).map((entry) => entry.end)];
+  const start = Math.max(0, Math.floor(Math.min(...starts) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES);
+  const end = Math.min(1440, Math.ceil(Math.max(...ends) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES);
+  return { start, end: Math.max(start + PLANNER_SLOT_MINUTES, end) };
+}
+
+function timedGridColumns(entries) {
+  const sorted = (entries || []).filter((entry) => Number.isFinite(entry.start)
+    && Number.isFinite(entry.end) && entry.end > entry.start)
+    .map((entry) => ({ ...entry }))
+    .sort((a, b) => (a.start - b.start) || (b.end - a.end) || String(a.key).localeCompare(String(b.key)));
+  const groups = [];
+  let group = [];
+  let groupEnd = -1;
+  for (const entry of sorted) {
+    if (group.length && entry.start >= groupEnd) {
+      groups.push(group);
+      group = [];
+      groupEnd = -1;
+    }
+    group.push(entry);
+    groupEnd = Math.max(groupEnd, entry.end);
+  }
+  if (group.length) groups.push(group);
+  for (const overlap of groups) {
+    const columnEnds = [];
+    for (const entry of overlap) {
+      let column = columnEnds.findIndex((end) => end <= entry.start);
+      if (column < 0) column = columnEnds.length;
+      columnEnds[column] = entry.end;
+      entry.column = column;
+    }
+    for (const entry of overlap) entry.columns = columnEnds.length;
+  }
+  return groups.flat();
+}
+
 // Minutes that `tz` is ahead of UTC at the given instant (cockpit types.js port).
 function tzOffsetMinutes(date, tz) {
   const dtf = new Intl.DateTimeFormat('en-US', {
@@ -4439,7 +4535,8 @@ function plannerToolbarMountPoint(root) {
  * Frontmatter is the plan database (the cockpit's plan_assignments analog):
  *   type: planner-item        source / external_id  - identity (idempotency key)
  *   status: open|done         - SOURCE truth, written by reconcile
- *   planned_day / planned_half / planned_order - the board placement
+ *   planned_day / planned_half / planned_order - legacy placement coordinates
+ *   planned_start / planned_duration / planned_occurrence_due - local timed placement
  *   done_local / weekly_goal  - planner-local flags (never written to source)
  *   linked_note               - plan-owned: the note this task is FOR
  * The AI team edits the same fields to move items; the board re-renders live.
@@ -4462,7 +4559,8 @@ function plannerToolbarMountPoint(root) {
 // The fields the planner owns on an item note. Sync pulls the rest and leaves
 // every one of these alone.
 const PLAN_OWNED_ITEM_FIELDS = [
-  'planned_day', 'planned_half', 'planned_order', 'done_local', 'weekly_goal', 'linked_note',
+  'planned_day', 'planned_half', 'planned_order', 'planned_start', 'planned_duration',
+  'planned_occurrence_due', 'done_local', 'weekly_goal', 'linked_note',
 ];
 
 // A linked-note value as it is STORED: `[[Note]]`, or null for none.
@@ -4503,6 +4601,9 @@ function itemFromFrontmatter(fm, path, basename) {
     plannedDay: fm.planned_day ? String(fm.planned_day).slice(0, 10) : null,
     plannedHalf: fm.planned_half === 'am' || fm.planned_half === 'pm' ? fm.planned_half : null,
     plannedOrder: Number.isFinite(Number(fm.planned_order)) ? Number(fm.planned_order) : 0,
+    plannedStart: typeof fm.planned_start === 'string' ? fm.planned_start : null,
+    plannedDuration: Number.isInteger(fm.planned_duration) ? fm.planned_duration : null,
+    plannedOccurrenceDue: fm.planned_occurrence_due ? String(fm.planned_occurrence_due).slice(0, 10) : null,
     doneLocal: fm.done_local === true,
     // `weekly_goal` is the key; "pinned to the week" is what it MEANS and
     // what every surface says since 0.14.0. The key is not renamed: a
@@ -4744,13 +4845,17 @@ function syncCompletionPlan({ prior, sourceItem, shadow, completeOnSource, recur
     // A plan on or after the new due was made for the NEXT occurrence and
     // stands in both modes; only a plan for a day before the new due belongs
     // to the occurrence that just finished.
+    const timedPlan = completeTimedPlacement(prior);
+    const timedPlanForNext = timedPlan && isOccurrenceTracked(prior)
+      && prior.plannedOccurrenceDue === sourceItem.due;
+    const staleTimedPlan = timedPlan && isOccurrenceTracked(prior) && !timedPlanForNext;
     const plannedBefore = !!(prior.plannedDay && prior.plannedDay < sourceItem.due);
     return {
       ...base,
       advanced: true,
       resetDoneLocal: true,
-      movePlan: mode === 'move' && plannedBefore ? { day: sourceItem.due, half: prior.plannedHalf || 'am' } : null,
-      clearPlan: mode === 'drop' && plannedBefore,
+      movePlan: mode === 'move' && plannedBefore && !timedPlan ? { day: sourceItem.due, half: prior.plannedHalf || 'am' } : null,
+      clearPlan: !!staleTimedPlan || (mode === 'drop' && plannedBefore && !timedPlan),
       occurrence: {
         due: shadow.due,
         plannedDay: plannedBefore ? prior.plannedDay : null,
@@ -6430,6 +6535,56 @@ function habitsCountText(habits, folder) {
   return `${parts.join(', ')} in ${folder}.`;
 }
 
+// Resolve the rail's vertical position against timed event boundaries. The
+// space between event chips remains empty; only the indicator traverses it.
+function nowRailTimedEvents(events) {
+  return (events || []).filter((event) =>
+    Number.isFinite(event.startMs) && Number.isFinite(event.endMs)
+    && event.endMs > event.startMs
+    && Number.isFinite(event.top) && Number.isFinite(event.bottom))
+    .sort((a, b) => a.startMs - b.startMs);
+}
+
+function nowRailState(mins, start, end, nowMs, events) {
+  const state = mins < start ? 'before' : (mins > end ? 'after' : 'on');
+  if (state === 'on') return state;
+  const inTimedEvent = nowRailTimedEvents(events).some((event) =>
+    nowMs >= event.startMs && nowMs <= event.endMs);
+  return inTimedEvent ? 'on' : state;
+}
+
+function nowRailEventPosition(nowMs, events, workday) {
+  const timed = nowRailTimedEvents(events);
+  const active = timed.find((event) => nowMs >= event.startMs && nowMs <= event.endMs);
+  if (active) {
+    const progress = (nowMs - active.startMs) / (active.endMs - active.startMs);
+    return active.top + (active.bottom - active.top) * progress;
+  }
+  let previous = null;
+  let next = null;
+  for (const event of timed) {
+    if (event.endMs < nowMs && (!previous || event.endMs > previous.endMs)) previous = event;
+    if (event.startMs > nowMs && (!next || event.startMs < next.startMs)) next = event;
+  }
+  if (!previous && next) {
+    if (!workday || !Number.isFinite(workday.startMs) || !Number.isFinite(workday.startPosition)
+      || !Number.isFinite(workday.endMs) || next.startMs <= workday.startMs
+      || next.startMs > workday.endMs) return null;
+    const progress = (nowMs - workday.startMs) / (next.startMs - workday.startMs);
+    return workday.startPosition + (next.top - workday.startPosition) * progress;
+  }
+  if (previous && !next) {
+    if (!workday || !Number.isFinite(workday.endMs) || !Number.isFinite(workday.endPosition)
+      || !Number.isFinite(workday.startMs) || previous.endMs < workday.startMs
+      || workday.endMs <= previous.endMs) return null;
+    const progress = (nowMs - previous.endMs) / (workday.endMs - previous.endMs);
+    return previous.bottom + (workday.endPosition - previous.bottom) * progress;
+  }
+  if (!previous || !next || next.startMs <= previous.endMs) return null;
+  const progress = (nowMs - previous.endMs) / (next.startMs - previous.endMs);
+  return previous.bottom + (next.top - previous.bottom) * progress;
+}
+
 /* ========================================================================== *
  * Weeks (2026-09-15)
  *
@@ -6711,6 +6866,9 @@ function weekPriorityProgress(week) {
 
 class IcorPlannerPlugin extends Plugin {
   async onload() {
+    this._unloaded = false;
+    this._startupSyncTimer = null;
+    this._emitTimer = null;
     // The secret store, when this Obsidian has one (feature-detected; see
     // the secret vault section). Then the settings from disk through
     // adoptSettings: the calendar migration, the secret migration (each
@@ -6802,6 +6960,7 @@ class IcorPlannerPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('layout-change', () => this.mountPlannerToolbarButton()));
 
     this.app.workspace.onLayoutReady(() => {
+      if (this._unloaded) return;
       // A renamed room is found before anything reads or writes a path.
       this.adoptPlannerFolder();
       this.ensureGitignore();
@@ -6816,7 +6975,10 @@ class IcorPlannerPlugin extends Plugin {
       // First sync shortly after startup (never blocking plugin load), then on
       // the configured cadence.
       if (this.anySourceConfigured()) {
-        window.setTimeout(() => this.syncNow(false), 4000);
+        this._startupSyncTimer = window.setTimeout(() => {
+          this._startupSyncTimer = null;
+          if (!this._unloaded) this.syncNow(false);
+        }, 4000);
       }
       this.scheduleSync();
     });
@@ -6948,9 +7110,12 @@ class IcorPlannerPlugin extends Plugin {
   // check would write to a SOURCE from an unloaded plugin, and a pending
   // shadow save would write settings the next load has already replaced.
   onunload() {
+    this._unloaded = true;
     setDisplayFormatSource(null);
     this.removeNextBadge();
     this.removePlannerToolbarButton();
+    if (this._startupSyncTimer != null) { window.clearTimeout(this._startupSyncTimer); this._startupSyncTimer = null; }
+    if (this._emitTimer != null) { window.clearTimeout(this._emitTimer); this._emitTimer = null; }
     if (this._cacheWriteTimer) { window.clearTimeout(this._cacheWriteTimer); this._cacheWriteTimer = null; }
     if (this._pushTimers) {
       for (const t of this._pushTimers.values()) window.clearTimeout(t);
@@ -6991,8 +7156,11 @@ class IcorPlannerPlugin extends Plugin {
 
   // Debounced fan-out to both views.
   emitModelChanged() {
+    if (this._unloaded) return;
     if (this._emitTimer) window.clearTimeout(this._emitTimer);
     this._emitTimer = window.setTimeout(() => {
+      this._emitTimer = null;
+      if (this._unloaded) return;
       this.app.workspace.getLeavesOfType(BOARD_VIEW_TYPE).forEach((l) => {
         if (l.view instanceof PlannerBoardView) l.view.render();
       });
@@ -7348,6 +7516,7 @@ class IcorPlannerPlugin extends Plugin {
   }
 
   async syncNow(manual) {
+    if (this._unloaded) return;
     if (this.syncing) { if (manual) new Notice('Planner sync already running.'); return; }
     this.syncing = true;
     this.emitModelChanged();
@@ -8026,13 +8195,10 @@ class IcorPlannerPlugin extends Plugin {
   // Applies the merge result: `finals` carries the settled two-way fields
   // (due / priority / description); source-owned metadata always pulls.
   //
-  // Every write below names its field. PLAN_OWNED_ITEM_FIELDS are not among
-  // them and never will be: `planned_day`, `planned_half`, `planned_order`,
-  // `done_local`, `weekly_goal` and `linked_note` are the planner's half of
-  // the note, and processFrontMatter leaves a field nobody assigns exactly as
-  // it was. The `ops` block below is the one exception and it is the plan
-  // acting on itself (a finished occurrence clearing its own placement),
-  // never the source reaching in.
+  // Every write below names its field. Planner-owned placement fields are not
+  // assigned by a source refresh; processFrontMatter preserves fields it does
+  // not name. The `ops` block below is the plan acting on itself when a
+  // finished occurrence clears its own placement, never the source reaching in.
   // `plan` (optional) is the syncCompletionPlan result: the occurrence
   // advance and the reopen confirmation are applied to the note here, in the
   // same frontmatter write as the source pull.
@@ -8077,7 +8243,14 @@ class IcorPlannerPlugin extends Plugin {
         if (fm.status === 'done') { fm.status = 'open'; delete fm.done_at; fm.done_local = false; }
         if (ops.clearReopenPending) delete fm.reopen_pending;
         if (ops.resetDoneLocal) { fm.done_local = false; fm.status = 'open'; delete fm.done_at; }
-        if (ops.clearPlan) { fm.planned_day = null; fm.planned_half = null; fm.planned_order = 0; }
+        if (ops.clearPlan) {
+          fm.planned_day = null;
+          fm.planned_half = null;
+          fm.planned_order = 0;
+          delete fm.planned_start;
+          delete fm.planned_duration;
+          delete fm.planned_occurrence_due;
+        }
         if (ops.movePlan) {
           // Appended at the end of the lane: the tap-to-plan convention
           // (order = wall-clock ms, past every hand order).
@@ -8123,6 +8296,27 @@ class IcorPlannerPlugin extends Plugin {
     });
   }
 
+  async assignTimedItem(path, day, start, duration, item) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+    const startMinute = plannedStartMinute(start);
+    if (!validPlannerDay(day) || startMinute == null) return;
+    const boundedDuration = clampPlannedDuration(startMinute, duration);
+    const occurrenceDue = isOccurrenceTracked(item) ? item.due : null;
+    if (isOccurrenceTracked(item) && !validPlannerDay(occurrenceDue)) {
+      new Notice('Planner: this recurring task needs an active due date before it can be scheduled.');
+      return;
+    }
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      fm.planned_day = day;
+      fm.planned_start = start;
+      fm.planned_duration = boundedDuration;
+      if (occurrenceDue) fm.planned_occurrence_due = occurrenceDue;
+      else delete fm.planned_occurrence_due;
+    });
+    this.emitModelChanged();
+  }
+
   async unassignItem(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
@@ -8130,6 +8324,9 @@ class IcorPlannerPlugin extends Plugin {
       fm.planned_day = null;
       fm.planned_half = null;
       fm.planned_order = 0;
+      delete fm.planned_start;
+      delete fm.planned_duration;
+      delete fm.planned_occurrence_due;
     });
   }
 
@@ -8881,7 +9078,7 @@ function wireEventChip(plugin, chip, ev) {
   chip.addEventListener('click', () => new EventDetailModal(plugin.app, ev, calendarFeedFor(plugin.withSecrets(), ev), plugin.manifest.id).open());
 }
 
-// One task card. mode: 'board' | 'tray'. `view.index` (buildItemIndex) is
+// One task card. mode: 'board' | 'tray' | 'timed'. `view.index` (buildItemIndex) is
 // where the parent kicker and the subtask counter come from; `view.expanded`
 // is the Set of parent paths whose list is open.
 function renderCard(plugin, item, mode, view) {
@@ -8889,7 +9086,7 @@ function renderCard(plugin, item, mode, view) {
   const index = view && view.index ? view.index : null;
   const parent = parentOf(item, index);
   const card = document.createElement('div');
-  card.className = 'iplan-card';
+  card.className = mode === 'timed' ? 'iplan-card iplan-time-entry iplan-time-task' : 'iplan-card';
   card.setAttribute('data-path', item.path);
   card.setAttribute('data-order', String(item.plannedOrder));
   card.setAttribute('data-source', item.source);
@@ -8977,6 +9174,7 @@ function renderCard(plugin, item, mode, view) {
     if (file instanceof TFile) plugin.app.workspace.getLeaf('tab').openFile(file);
   });
   if (ghost) return card;
+  if (mode === 'timed') wireTimedTaskResize(plugin, item, card, view);
   card.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showCardMenu(plugin, item, view, { x: e.clientX, y: e.clientY });
@@ -9128,19 +9326,17 @@ function renderHabitsBlock(plugin, occs, day, today, view) {
   return block;
 }
 
-// One routine block (2026-09-04). Not draggable: it sits where its time
-// puts it. Row one the kicker (type and time), row two the name, row three
-// the steps as the shared checklist with its "n of m". Complete strikes
-// like a task; skipped is a ghost with its rows disabled. The type is said
-// by the kicker word and by the lane half it sits in, never by a colour.
-function renderRoutineCard(plugin, occ, view) {
+// A routine keeps its configured interval. The time-scaled board uses only
+// the routine name while collapsed; other surfaces retain the shared kicker.
+function renderRoutineCard(plugin, occ, view, timeScaled) {
   const state = routineCardState(occ);
   const routine = occ.routine;
   const expanded = view && view.routineExpanded instanceof Set ? view.routineExpanded : null;
   const occurrenceKey = JSON.stringify([routine.path, occ.day]);
-  let open = expanded ? expanded.has(occurrenceKey) : true;
+  let open = expanded ? expanded.has(occurrenceKey) : false;
   const card = document.createElement('div');
   card.className = `iplan-card iplan-routine is-${routine.routineType}`;
+  if (timeScaled) card.classList.add('iplan-time-entry', 'iplan-time-routine');
   card.setAttribute('data-routine', routine.path);
   card.setAttribute('data-order', String(occ.startMin));
   card.draggable = false;
@@ -9165,11 +9361,11 @@ function renderRoutineCard(plugin, occ, view) {
   const title = document.createElement('div');
   title.className = 'iplan-card-title';
   title.textContent = routine.name;
-  card.appendChild(meta);
+  if (!timeScaled) card.appendChild(meta);
   card.appendChild(title);
 
-  const steps = expanded ? document.createElement('div') : card;
-  if (expanded) {
+  const steps = !timeScaled && expanded ? document.createElement('div') : null;
+  if (steps) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'iplan-card-sub-toggle';
@@ -9199,14 +9395,16 @@ function renderRoutineCard(plugin, occ, view) {
     paint();
   }
 
-  const model = checklistModel({
-    rows: occ.steps.map((s) => ({ id: s.index, label: s.label, checked: s.done, disabled: state.ghost })),
-  });
-  renderChecklist(steps, model, {
-    ariaLabel: `${routine.name}, ${routineKicker(occ).toLowerCase()} steps`,
-    onToggle: (id, next) => plugin.toggleRoutineStep(routine.path, occ.day, Number(id), next, occ.total),
-    onProgress: (done, total) => card.classList.toggle('is-done', total > 0 && done === total),
-  });
+  if (steps) {
+    const model = checklistModel({
+      rows: occ.steps.map((s) => ({ id: s.index, label: s.label, checked: s.done, disabled: state.ghost })),
+    });
+    renderChecklist(steps, model, {
+      ariaLabel: `${routine.name}, ${routineKicker(occ).toLowerCase()} steps`,
+      onToggle: (id, next) => plugin.toggleRoutineStep(routine.path, occ.day, Number(id), next, occ.total),
+      onProgress: (done, total) => card.classList.toggle('is-done', total > 0 && done === total),
+    });
+  }
 
   const openNote = () => {
     const file = plugin.app.vault.getAbstractFileByPath(routine.path);
@@ -9287,23 +9485,20 @@ function showCardMenu(plugin, item, view, pos) {
   menu.showAtPosition(pos);
 }
 
-// Tap-to-plan: pick a day and half of the board's current week. The card
-// lands at the end of the lane (order = wall-clock ms, past every hand
-// order); the next drag renormalizes via orderForInsert.
+// Tap-to-plan uses the configured workday start and the normal first-placement duration.
 function showPlanMenu(plugin, item, view, pos) {
   const weekStart = (view && view.weekStart) || mondayOf(todayStr());
   const today = todayStr();
   const days = weekDays(weekStart)
     .filter((d, i) => plugin.settings.showWeekend || i < 5);
+  const start = plannedStartText(snapPlannerMinute(hmToMin(plugin.settings.dayStart, 480)));
   const menu = new Menu();
   days.forEach((day, i) => {
     const label = `${DAY_NAMES[i]} ${fmtDayNum(day)}${day === today ? ' (today)' : ''}`;
-    for (const half of ['am', 'pm']) {
-      menu.addItem((mi) => mi
-        .setTitle(`${label} · ${half === 'am' ? 'morning' : 'afternoon'}`)
-        .setIcon(half === 'am' ? 'sunrise' : 'sunset')
-        .onClick(() => plugin.assignItem(item.path, day, half, Date.now())));
-    }
+    menu.addItem((mi) => mi
+      .setTitle(`${label} · ${start}`)
+      .setIcon('calendar')
+      .onClick(() => plugin.assignTimedItem(item.path, day, start, PLANNER_DEFAULT_DURATION, item)));
   });
   menu.showAtPosition(pos);
 }
@@ -9353,6 +9548,111 @@ function wireDropLane(laneEl, onDrop) {
     const path = e.dataTransfer.getData('text/plain');
     if (path) onDrop(path, idx);
   });
+}
+
+function wireTimedDrop(slots, grid, onDrop) {
+  let marker = null;
+  let previewMinute = null;
+  const clear = () => {
+    if (marker) marker.remove();
+    marker = null;
+    previewMinute = null;
+    slots.classList.remove('is-drop-target');
+  };
+  const minuteAt = (clientY) => {
+    const rect = slots.getBoundingClientRect();
+    const minute = grid.start + (clientY - rect.top) / PLANNER_PIXELS_PER_MINUTE;
+    return snapPlannerMinute(minute);
+  };
+  slots.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    slots.classList.add('is-drop-target');
+    if (!marker) marker = slots.createDiv({ cls: 'iplan-time-drop-line' });
+    previewMinute = minuteAt(event.clientY);
+    marker.style.top = `${(previewMinute - grid.start) * PLANNER_PIXELS_PER_MINUTE}px`;
+  });
+  slots.addEventListener('dragleave', (event) => {
+    if (!slots.contains(event.relatedTarget)) clear();
+  });
+  slots.addEventListener('drop', (event) => {
+    event.preventDefault();
+    const start = previewMinute == null ? minuteAt(event.clientY) : previewMinute;
+    const path = event.dataTransfer.getData('text/plain');
+    clear();
+    if (path) onDrop(path, start);
+  });
+}
+
+function wireTimedTaskResize(plugin, item, card, view) {
+  const placement = activeTimedPlacement(item);
+  if (!placement) return;
+  let duration = placement.duration;
+  const handle = document.createElement('button');
+  handle.type = 'button';
+  handle.className = 'iplan-time-resize';
+  handle.setAttribute('role', 'slider');
+  handle.setAttribute('aria-orientation', 'vertical');
+  handle.setAttribute('aria-label', `Duration for ${item.title}`);
+  const update = (next, persist) => {
+    duration = clampPlannedDuration(placement.start, next);
+    card.style.height = `${duration * PLANNER_PIXELS_PER_MINUTE}px`;
+    handle.setAttribute('aria-valuemin', String(PLANNER_SLOT_MINUTES));
+    handle.setAttribute('aria-valuemax', String(Math.floor((1440 - placement.start) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES));
+    handle.setAttribute('aria-valuenow', String(duration));
+    handle.title = `${duration} minutes`;
+    item.plannedDuration = duration;
+    if (persist) {
+      plugin.assignTimedItem(item.path, placement.day, plannedStartText(placement.start), duration, item);
+      if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
+    }
+  };
+  update(duration, false);
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const startY = event.clientY;
+    const startDuration = duration;
+    const move = (nextEvent) => {
+      if (nextEvent.pointerId !== event.pointerId) return;
+      const steps = Math.round((nextEvent.clientY - startY) / (PLANNER_SLOT_MINUTES * PLANNER_PIXELS_PER_MINUTE));
+      update(startDuration + steps * PLANNER_SLOT_MINUTES, false);
+      if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
+    };
+    const finish = (nextEvent) => {
+      if (nextEvent.pointerId !== event.pointerId) return;
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', cancel);
+      if (nextEvent.type === 'pointerup') update(duration, true);
+      else update(startDuration, false);
+      if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
+    };
+    const cancel = (nextEvent) => finish(nextEvent);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', cancel);
+    if (typeof handle.setPointerCapture === 'function') handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown' && event.key !== 'Home' && event.key !== 'End') return;
+    event.preventDefault();
+    let nextDuration;
+    if (event.key === 'Home') {
+      nextDuration = Number(handle.getAttribute('aria-valuemin'));
+    } else if (event.key === 'End') {
+      nextDuration = Number(handle.getAttribute('aria-valuemax'));
+    } else {
+      nextDuration = duration + (event.key === 'ArrowUp' ? PLANNER_SLOT_MINUTES : -PLANNER_SLOT_MINUTES);
+    }
+    update(nextDuration, true);
+  });
+  handle.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  card.appendChild(handle);
 }
 
 /* ========================================================================== *
@@ -9902,10 +10202,13 @@ class PlannerBoardView extends ItemView {
     this.plugin = plugin;
     this.weekStart = mondayOf(todayStr());
     this.mode = 'week'; // 'week' | 'day'
+    this.layout = 'overview'; // 'overview' | 'calendar'
     this.day = todayStr();
     this.index = null;          // buildItemIndex, per render
     this.expanded = new Set();  // parent paths whose subtask list is open
     this.routineExpanded = new Set();
+    this.timedGrids = new Map();
+    this.timeScrollPositions = new Map();
   }
 
   getViewType() { return BOARD_VIEW_TYPE; }
@@ -9916,20 +10219,28 @@ class PlannerBoardView extends ItemView {
     this.contentEl.addClass('iplan-root');
     markInkPlugin(this.contentEl, this.plugin.manifest.id);
     this.render();
-    // Minute tick keeps the now-rail honest.
-    this.registerInterval(window.setInterval(() => this.updateNowRail(), 60000));
+    if (this.nowRailInterval != null) window.clearInterval(this.nowRailInterval);
+    this.nowRailInterval = window.setInterval(() => this.updateNowRail(), 1000);
+    this.plugin.registerInterval(this.nowRailInterval);
     if (this.plugin.anySourceConfigured() && !this.plugin.lastSyncAt && !this.plugin.syncing) {
       this.plugin.syncNow(false);
     }
   }
 
-  async onClose() { this.contentEl.empty(); }
+  async onClose() {
+    if (this.nowRailInterval != null) {
+      window.clearInterval(this.nowRailInterval);
+      this.nowRailInterval = null;
+    }
+    this.contentEl.empty();
+  }
 
-  getState() { return { weekStart: this.weekStart, mode: this.mode, day: this.day }; }
+  getState() { return { weekStart: this.weekStart, mode: this.mode, day: this.day, layout: this.layout }; }
   async setState(state, result) {
     if (state) {
       if (state.weekStart) this.weekStart = state.weekStart;
       if (state.mode === 'day' || state.mode === 'week') this.mode = state.mode;
+      if (state.layout === 'overview' || state.layout === 'calendar') this.layout = state.layout;
       if (state.day) this.day = state.day;
       this.render();
     }
@@ -9944,11 +10255,23 @@ class PlannerBoardView extends ItemView {
     this.render();
   }
 
+  setLayout(layout) {
+    if (layout !== 'overview' && layout !== 'calendar') return;
+    this.layout = layout;
+    this.render();
+  }
+
   render() {
     const el = this.contentEl;
     el.empty();
+    this.timedGrids.clear();
+    this._todayCol = null;
+    this._todayGrid = null;
+    this._nowRail = null;
+    this._countdown = null;
     const today = todayStr();
     const isDay = this.mode === 'day';
+    const isCalendar = this.layout === 'calendar';
     const items = collectItems(this.plugin.app, this.plugin.paths().root);
     this.index = buildItemIndex(items);
     const splitHour = this.plugin.splitHour();
@@ -9971,15 +10294,18 @@ class PlannerBoardView extends ItemView {
     });
 
     const nav = titleRow.createDiv({ cls: 'iplan-nav' });
-    // WEEK | DAY segment switch
-    const seg = nav.createDiv({ cls: 'iplan-seg' });
-    const mkSeg = (label, mode) => {
-      const b = seg.createEl('button', { cls: 'iplan-seg-btn', text: label });
-      if (this.mode === mode) b.addClass('is-active');
-      b.addEventListener('click', () => this.setMode(mode));
+    // Range and layout are independent segmented controls.
+    const seg = nav.createDiv({ cls: 'iplan-seg', attr: { 'aria-label': 'Range' } });
+    const mkSeg = (group, label, value, active, select) => {
+      const b = group.createEl('button', { cls: 'iplan-seg-btn', text: label, attr: { 'aria-pressed': active === value ? 'true' : 'false' } });
+      if (active === value) b.addClass('is-active');
+      b.addEventListener('click', () => select(value));
     };
-    mkSeg('WEEK', 'week');
-    mkSeg('DAY', 'day');
+    mkSeg(seg, 'WEEK', 'week', this.mode, (value) => this.setMode(value));
+    mkSeg(seg, 'DAY', 'day', this.mode, (value) => this.setMode(value));
+    const layoutSeg = nav.createDiv({ cls: 'iplan-seg', attr: { 'aria-label': 'Layout' } });
+    mkSeg(layoutSeg, 'OVERVIEW', 'overview', this.layout, (value) => this.setLayout(value));
+    mkSeg(layoutSeg, 'CALENDAR', 'calendar', this.layout, (value) => this.setLayout(value));
     const mkNavBtn = (icon, label, fn) => {
       const b = nav.createEl('button', { cls: 'iplan-nav-btn', attr: { 'aria-label': label } });
       setIcon(b, icon);
@@ -10050,44 +10376,11 @@ class PlannerBoardView extends ItemView {
     if (isDay) board.addClass('is-day');
     board.style.setProperty('--iplan-day-count', String(visibleDays.length));
 
-    const itemsByCell = new Map(); // day|half -> items
-    for (const it of items) {
-      if (!it.plannedDay || !it.plannedHalf) continue;
-      const key = `${it.plannedDay}|${it.plannedHalf}`;
-      if (!itemsByCell.has(key)) itemsByCell.set(key, []);
-      itemsByCell.get(key).push(it);
-    }
-    for (const list of itemsByCell.values()) list.sort((a, b) => a.plannedOrder - b.plannedOrder);
-    // Finished occurrences of recurring tasks, rendered after the live
-    // sequence of their lane, read-only.
-    const ghostsByCell = new Map();
-    for (const g of ghostItemsFor(items)) {
-      const key = `${g.plannedDay}|${g.plannedHalf}`;
-      if (!ghostsByCell.has(key)) ghostsByCell.set(key, []);
-      ghostsByCell.get(key).push(g);
-    }
-    for (const list of ghostsByCell.values()) list.sort((a, b) => String(a.due || '').localeCompare(String(b.due || '')));
-    // Routines (2026-09-04): the day's instances, by lane, sequenced with
-    // the events and the tasks below.
-    const routinesByCell = new Map();
-    for (const day of visibleDays) {
-      for (const occ of this.plugin.routinesFor(day)) {
-        const key = `${day}|${occ.half}`;
-        if (!routinesByCell.has(key)) routinesByCell.set(key, []);
-        routinesByCell.get(key).push(occ);
-      }
-    }
-
-    const eventsByCell = new Map();
     const allDayByDay = new Map();
     for (const ev of events) {
       if (ev.allDay || !ev.half) {
         if (!allDayByDay.has(ev.day)) allDayByDay.set(ev.day, []);
         allDayByDay.get(ev.day).push(ev);
-      } else {
-        const key = `${ev.day}|${ev.half}`;
-        if (!eventsByCell.has(key)) eventsByCell.set(key, []);
-        eventsByCell.get(key).push(ev);
       }
     }
 
@@ -10113,50 +10406,12 @@ class PlannerBoardView extends ItemView {
         }
       }
 
-      for (const half of ['am', 'pm']) {
-        if (half === 'pm') {
-          const s = this.plugin.settings;
-          if (s.lunchEnabled) {
-            const band = col.createDiv({ cls: 'iplan-lunch' });
-            band.style.height = `${lunchBandHeight(s.lunchStart, s.lunchEnd)}px`;
-            band.createSpan({
-              cls: 'iplan-split-time',
-              text: `${s.lunchStart || '12:30'} - ${s.lunchEnd || '13:30'} LUNCH`,
-            });
-          } else {
-            const divider = col.createDiv({ cls: 'iplan-split' });
-            divider.createSpan({ cls: 'iplan-split-time', text: s.splitTime || '13:00' });
-          }
-        }
-        const lane = col.createDiv({ cls: 'iplan-lane', attr: { 'data-day': day, 'data-half': half } });
-        const laneEvents = (eventsByCell.get(`${day}|${half}`) || []);
-        const cell = itemsByCell.get(`${day}|${half}`) || [];
-        const laneRoutines = routinesByCell.get(`${day}|${half}`) || [];
-        // One sequential order per lane: event 09:00, routine 09:00, task,
-        // event 11:00, task.
-        for (const entry of laneSequence(laneEvents, cell, laneRoutines)) {
-          if (entry.kind === 'event') {
-            const chip = lane.createDiv({ cls: 'iplan-event' });
-            chip.createSpan({ cls: 'iplan-event-time', text: `${fmtTimeHM(entry.ev.start)}` });
-            chip.createSpan({ cls: 'iplan-event-title', text: entry.ev.title });
-            this.wireEvent(chip, entry.ev);
-          } else if (entry.kind === 'routine') {
-            lane.appendChild(renderRoutineCard(this.plugin, entry.occ, this));
-          } else {
-            lane.appendChild(renderCard(this.plugin, entry.it, 'board', this));
-          }
-        }
-        const ghosts = ghostsByCell.get(`${day}|${half}`) || [];
-        for (const g of ghosts) lane.appendChild(renderCard(this.plugin, g, 'board', this));
-        if (!laneEvents.length && !cell.length && !ghosts.length && !laneRoutines.length) lane.createDiv({ cls: 'iplan-lane-empty', text: half === 'am' ? 'morning' : 'afternoon' });
-
-        wireDropLane(lane, (path, index) => {
-          // Same mixed sequence the lane was rendered from, minus the dragged
-          // task, so `index` (computed over chips, blocks and cards) maps 1:1.
-          const current = laneSequence(laneEvents, cell, laneRoutines).filter((x) => x.kind !== 'task' || x.path !== path);
-          const order = this.plugin.orderForInsert(current, index);
-          this.plugin.assignItem(path, day, half, order);
-        });
+      const routines = this.plugin.routinesFor(day);
+      if (isCalendar) {
+        this.renderUntimedTasks(day, col, items);
+        this.renderTimedGrid(day, col, items, events, routines);
+      } else {
+        this.renderOverviewDay(day, col, items, events, routines);
       }
 
       // Habits (2026-09-04): the day's all-day block under the afternoon lane.
@@ -10164,25 +10419,9 @@ class PlannerBoardView extends ItemView {
       if (habitOccs.length) col.appendChild(renderHabitsBlock(this.plugin, habitOccs, day, today, this));
 
       if (day === today) {
-        const rail = col.createDiv({ cls: 'iplan-now-rail' });
-        col.dataset.railState = 'on';
-        this._todayCol = col;
-        this._nowRail = rail;
-        // cockpit countdown: time left in the current half, right under the head
-        const cd = document.createElement('div');
-        cd.className = 'iplan-countdown';
-        const track = document.createElement('div');
-        track.className = 'iplan-countdown-track';
-        const fill = document.createElement('div');
-        fill.className = 'iplan-countdown-fill';
-        track.appendChild(fill);
-        const cdLabel = document.createElement('span');
-        cdLabel.className = 'iplan-countdown-label';
-        cd.appendChild(track);
-        cd.appendChild(cdLabel);
-        colHead.insertAdjacentElement('afterend', cd);
-        this._countdown = { wrap: cd, fill, label: cdLabel };
+        this.renderNowIndicators(col, colHead, isCalendar ? this.timedGrids.get(day).slots : null);
       }
+
     }
     this.updateNowRail();
 
@@ -10194,6 +10433,202 @@ class PlannerBoardView extends ItemView {
     foot.createSpan({ text: stamp });
     foot.createSpan({ cls: 'iplan-foot-dot', text: ' · ' });
     foot.createSpan({ text: fmtOpenItems(items.filter((i) => !isDone(i)).length) });
+  }
+
+  renderOverviewDay(day, col, items, events, routines) {
+    const agenda = agendaSections(items, events, day, routines, this.plugin.splitHM());
+    const ghostsByHalf = { am: [], pm: [] };
+    for (const ghost of ghostItemsFor(items)) {
+      if (ghost.plannedDay === day && (ghost.plannedHalf === 'am' || ghost.plannedHalf === 'pm')) {
+        ghostsByHalf[ghost.plannedHalf].push(ghost);
+      }
+    }
+    for (const half of ['am', 'pm']) {
+      ghostsByHalf[half].sort((a, b) => String(a.due || '').localeCompare(String(b.due || '')));
+    }
+    for (const half of ['am', 'pm']) {
+      if (half === 'pm') {
+        const settings = this.plugin.settings;
+        if (settings.lunchEnabled) {
+          const band = col.createDiv({ cls: 'iplan-lunch' });
+          band.style.height = `${lunchBandHeight(settings.lunchStart, settings.lunchEnd)}px`;
+          band.createSpan({
+            cls: 'iplan-split-time',
+            text: `${settings.lunchStart || '12:30'} - ${settings.lunchEnd || '13:30'} LUNCH`,
+          });
+        } else {
+          const divider = col.createDiv({ cls: 'iplan-split' });
+          divider.createSpan({ cls: 'iplan-split-time', text: settings.splitTime || '13:00' });
+        }
+      }
+      const lane = col.createDiv({ cls: 'iplan-lane', attr: { 'data-day': day, 'data-half': half } });
+      const sequence = agenda[half];
+      for (const entry of sequence) {
+        if (entry.kind === 'event') {
+          const chip = lane.createDiv({ cls: 'iplan-event' });
+          chip.createSpan({ cls: 'iplan-event-time', text: fmtTimeHM(entry.ev.start) });
+          chip.createSpan({ cls: 'iplan-event-title', text: entry.ev.title });
+          this.wireEvent(chip, entry.ev);
+        } else if (entry.kind === 'routine') {
+          lane.appendChild(renderRoutineCard(this.plugin, entry.occ, this));
+        } else {
+          lane.appendChild(renderCard(this.plugin, entry.it, 'board', this));
+        }
+      }
+      const ghosts = ghostsByHalf[half];
+      for (const ghost of ghosts) lane.appendChild(renderCard(this.plugin, ghost, 'board', this));
+      if (!sequence.length && !ghosts.length) {
+        lane.createDiv({ cls: 'iplan-lane-empty', text: half === 'am' ? 'morning' : 'afternoon' });
+      }
+      wireDropLane(lane, (path, index) => {
+        const current = sequence.filter((entry) => entry.kind !== 'task' || entry.path !== path);
+        const order = this.plugin.orderForInsert(current, index);
+        this.plugin.assignItem(path, day, half, order);
+      });
+    }
+  }
+
+  renderUntimedTasks(day, col, items) {
+    const tasks = (items || []).filter((item) => isUntimedHalfDayItem(item, day));
+    if (!tasks.length) return;
+    const section = col.createDiv({ cls: 'iplan-time-untimed' });
+    section.createDiv({ cls: 'iplan-time-untimed-title', text: 'UNTIMED TASKS' });
+    for (const half of ['am', 'pm']) {
+      const inHalf = tasks.filter((item) => item.plannedHalf === half);
+      if (!inHalf.length) continue;
+      const group = section.createDiv({ cls: 'iplan-time-untimed-group' });
+      group.createDiv({ cls: 'iplan-time-untimed-half', text: half === 'am' ? 'MORNING' : 'AFTERNOON' });
+      for (const item of inHalf) group.appendChild(renderCard(this.plugin, item, 'board', this));
+    }
+  }
+
+  renderNowIndicators(col, colHead, timedGrid) {
+    this._todayCol = col;
+    this._todayGrid = timedGrid;
+    this._nowRail = (timedGrid || col).createDiv({ cls: 'iplan-now-rail' });
+    col.dataset.railState = 'on';
+    const cd = document.createElement('div');
+    cd.className = 'iplan-countdown';
+    const track = document.createElement('div');
+    track.className = 'iplan-countdown-track';
+    const fill = document.createElement('div');
+    fill.className = 'iplan-countdown-fill';
+    track.appendChild(fill);
+    const label = document.createElement('span');
+    label.className = 'iplan-countdown-label';
+    cd.appendChild(track);
+    cd.appendChild(label);
+    colHead.insertAdjacentElement('afterend', cd);
+    this._countdown = { wrap: cd, fill, label };
+  }
+
+  renderTimedGrid(day, col, items, events, routines) {
+    const entries = [];
+    for (const item of items) {
+      const placement = activeTimedPlacement(item);
+      if (placement && placement.day === day) {
+        entries.push({
+          key: `task:${item.path}`, kind: 'task', item, start: placement.start,
+          end: placement.end, duration: placement.duration,
+        });
+      }
+    }
+    for (const ev of events) {
+      if (ev.day !== day || ev.allDay || !ev.half || !ev.start || !ev.end) continue;
+      const startDate = new Date(ev.start);
+      const endDate = new Date(ev.end);
+      if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || localDayStr(startDate) !== day) continue;
+      const start = startDate.getHours() * 60 + startDate.getMinutes();
+      const end = localDayStr(endDate) === day ? endDate.getHours() * 60 + endDate.getMinutes() : 1440;
+      if (end <= start) continue;
+      entries.push({ key: `event:${ev.uid}`, kind: 'event', ev, start, end, duration: end - start });
+    }
+    for (const occ of routines || []) {
+      if (occ.endMin <= occ.startMin) continue;
+      entries.push({
+        key: `routine:${occ.routine.path}:${day}`, kind: 'routine', occ,
+        start: occ.startMin, end: occ.endMin, duration: occ.endMin - occ.startMin,
+      });
+    }
+
+    const bounds = timedGridBounds(0, 1440, entries);
+    const height = (bounds.end - bounds.start) * PLANNER_PIXELS_PER_MINUTE;
+    const scroll = col.createDiv({ cls: 'iplan-time-scroll' });
+    const canvas = scroll.createDiv({ cls: 'iplan-time-canvas' });
+    canvas.style.height = `${height}px`;
+    const axis = canvas.createDiv({ cls: 'iplan-time-axis', attr: { 'aria-hidden': 'true' } });
+    for (let minute = bounds.start; minute <= bounds.end; minute += 60) {
+      const label = axis.createDiv({ cls: 'iplan-time-label', text: plannedStartText(minute) });
+      label.style.top = `${(minute - bounds.start) * PLANNER_PIXELS_PER_MINUTE}px`;
+    }
+    const slots = canvas.createDiv({ cls: 'iplan-time-slots', attr: { 'data-day': day } });
+    slots.style.height = `${height}px`;
+    const grid = { day, start: bounds.start, end: bounds.end, entries, slots, scroll, canvas };
+    this.timedGrids.set(day, grid);
+
+    for (const entry of entries) {
+      let element;
+      if (entry.kind === 'event') {
+        element = slots.createDiv({ cls: 'iplan-event iplan-time-entry iplan-time-event' });
+        const startDate = new Date(entry.ev.start);
+        const endDate = new Date(entry.ev.end);
+        element.dataset.startMs = String(startDate.getTime());
+        const visibleEnd = localDayStr(endDate) === day
+          ? endDate.getTime()
+          : new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate() + 1).getTime();
+        element.dataset.endMs = String(visibleEnd);
+        element.createSpan({ cls: 'iplan-event-time', text: fmtTimeHM(entry.ev.start) });
+        element.createSpan({ cls: 'iplan-event-title', text: entry.ev.title });
+        this.wireEvent(element, entry.ev);
+      } else if (entry.kind === 'routine') {
+        element = renderRoutineCard(this.plugin, entry.occ, this, true);
+        slots.appendChild(element);
+      } else {
+        element = renderCard(this.plugin, entry.item, 'timed', this);
+        slots.appendChild(element);
+      }
+      entry.element = element;
+      element.style.top = `${(entry.start - bounds.start) * PLANNER_PIXELS_PER_MINUTE}px`;
+      element.style.height = `${entry.duration * PLANNER_PIXELS_PER_MINUTE}px`;
+    }
+
+    const initialScroll = this.timeScrollPositions.has(day)
+      ? this.timeScrollPositions.get(day)
+      : hmToMin(this.plugin.settings.dayStart, 480) * PLANNER_PIXELS_PER_MINUTE;
+    scroll.scrollTop = initialScroll;
+    scroll.addEventListener('scroll', () => this.timeScrollPositions.set(day, scroll.scrollTop));
+    wireTimedDrop(slots, grid, (path, start) => {
+      const item = items.find((candidate) => candidate.path === path);
+      if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start),
+        clampPlannedDuration(start, PLANNER_DEFAULT_DURATION), item);
+    });
+    this.relayoutTimedGrid(day);
+
+  }
+
+  relayoutTimedGrid(day) {
+    const grid = this.timedGrids.get(day);
+    if (!grid) return;
+    for (const entry of grid.entries) {
+      if (entry.kind !== 'task') continue;
+      const duration = plannedDuration(entry.item.plannedDuration);
+      if (duration) {
+        entry.duration = duration;
+        entry.end = entry.start + duration;
+      }
+    }
+    const layout = timedGridColumns(grid.entries);
+    let contentEnd = grid.end - grid.start;
+    for (const entry of layout) {
+      const top = (entry.start - grid.start) * PLANNER_PIXELS_PER_MINUTE;
+      entry.element.style.top = `${top}px`;
+      entry.element.style.left = `${entry.column * 100 / entry.columns}%`;
+      entry.element.style.width = `calc(${100 / entry.columns}% - 4px)`;
+      contentEnd = Math.max(contentEnd, top + entry.element.getBoundingClientRect().height);
+    }
+    const height = Math.ceil(contentEnd);
+    grid.slots.style.height = `${height}px`;
+    grid.canvas.style.height = `${height}px`;
   }
 
   wireEvent(chip, ev) {
@@ -10212,9 +10647,32 @@ class PlannerBoardView extends ItemView {
     const end = parse(this.plugin.settings.dayEnd, 1080);
     const now = new Date();
     const mins = now.getHours() * 60 + now.getMinutes();
-    const pct = Math.max(0, Math.min(1, (mins - start) / Math.max(1, end - start)));
+    const clockMins = mins + now.getSeconds() / 60 + now.getMilliseconds() / 60000;
+    const pct = Math.max(0, Math.min(1, (clockMins - start) / Math.max(1, end - start)));
     this._todayCol.style.setProperty('--iplan-now-pct', String(pct));
-    this._todayCol.dataset.railState = mins < start ? 'before' : (mins > end ? 'after' : 'on');
+    if (this._todayGrid) {
+      const gridRect = this._todayGrid.getBoundingClientRect();
+      const events = Array.from(this._todayGrid.querySelectorAll('.iplan-event[data-start-ms][data-end-ms]')).map((chip) => {
+        const rect = chip.getBoundingClientRect();
+        return {
+          startMs: Number(chip.dataset.startMs), endMs: Number(chip.dataset.endMs),
+          top: rect.top - gridRect.top, bottom: rect.bottom - gridRect.top,
+        };
+      });
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const eventPosition = nowRailEventPosition(now.getTime(), events, {
+        startMs: new Date(today.getFullYear(), today.getMonth(), today.getDate(), Math.floor(start / 60), start % 60).getTime(),
+        endMs: new Date(today.getFullYear(), today.getMonth(), today.getDate(), Math.floor(end / 60), end % 60).getTime(),
+        startPosition: start * PLANNER_PIXELS_PER_MINUTE,
+        endPosition: end * PLANNER_PIXELS_PER_MINUTE,
+      });
+      this._todayCol.dataset.railState = nowRailState(mins, start, end, now.getTime(), events);
+      const railPosition = eventPosition == null ? clockMins * PLANNER_PIXELS_PER_MINUTE : eventPosition;
+      this._nowRail.style.setProperty('--iplan-now-top', `${railPosition}px`);
+    } else {
+      this._todayCol.dataset.railState = mins < start ? 'before' : (mins >= end ? 'after' : 'on');
+      this._nowRail.style.removeProperty('--iplan-now-top');
+    }
     if (this._countdown && this._countdown.wrap.isConnected) {
       const seg = segmentInfo(this.plugin.settings, mins);
       // A class, never an inline display: an inline style is out of reach of
@@ -10419,19 +10877,17 @@ function trayRevealSpendsTurn(decision) {
   return decision === 'create-and-reveal' || decision === 'reveal';
 }
 
-// Section model for the AGENDA tab, board-parity by construction: events are
-// the week's expanded set (icsEventsForWeek output), tasks the full item list.
-// Banding mirrors the board exactly - `allDay || !half` goes to the top band
-// (so continuation days of multi-day timed events land there too), timed
-// events join tasks planned for today's half in ONE laneSequence per half.
-// Done tasks stay in (struck at render, like the board); tasks without a
-// planned half are skipped (the board skips them too). Events pass through
-// by reference so the stale treatment and the detail modal see the real
-// objects. No splitHour parameter: expanded events already carry their half.
-// Routine instances (2026-09-04, routineOccurrences output for `today`) join
-// the same sequence per half, so the AGENDA tab stays board-parity by
-// construction as routines arrive.
-function agendaSections(items, events, today, routineOccs) {
+// The read-only agenda keeps its half-based list, deriving a timed task's
+// half from the configured split while Calendar uses exact minutes.
+function isUntimedHalfDayItem(item, day) {
+  return !!item && item.plannedDay === day
+    && (item.plannedHalf === 'am' || item.plannedHalf === 'pm')
+    && !item.plannedOccurrenceDue
+    && (!item.plannedStart || item.plannedDuration == null)
+    && !activeTimedPlacement(item);
+}
+
+function agendaSections(items, events, today, routineOccs, splitTime) {
   const allDay = [];
   const evHalf = { am: [], pm: [] };
   for (const ev of events || []) {
@@ -10441,8 +10897,13 @@ function agendaSections(items, events, today, routineOccs) {
   }
   const taskHalf = { am: [], pm: [] };
   for (const it of items || []) {
-    if (it.plannedDay !== today || !it.plannedHalf) continue;
-    taskHalf[it.plannedHalf].push(it);
+    const placement = activeTimedPlacement(it);
+    if (placement && placement.day === today) {
+      const half = routineHalf(placement.start, splitTime || '13:00');
+      taskHalf[half].push({ ...it, plannedOrder: placement.start });
+    } else if (!placement && isUntimedHalfDayItem(it, today)) {
+      taskHalf[it.plannedHalf].push(it);
+    }
   }
   const routineHalfOf = { am: [], pm: [] };
   for (const occ of routineOccs || []) {
@@ -10806,7 +11267,7 @@ class PlannerTrayView extends ItemView {
     const events = this.plugin.calendarDefs
       ? icsEventsForWeek(this.plugin.calendarDefs, mondayOf(today), this.plugin.splitHour())
       : [];
-    const model = agendaSections(items, events, today, this.plugin.routinesFor(today));
+    const model = agendaSections(items, events, today, this.plugin.routinesFor(today), this.plugin.splitHM());
 
     const dayHead = el.createDiv({ cls: 'iplan-tray-agenda-head' });
     dayHead.createSpan({ cls: 'iplan-tray-agenda-title', text: fmtDayTitle(today, today) });
@@ -10997,7 +11458,7 @@ class PlannerTrayView extends ItemView {
       const configured = sourceConfigured(resolved, key);
       const st = this.plugin.syncStatus[key];
       const list = items
-        .filter((i) => i.source === key && !i.plannedDay && !isDone(i) && !i.weeklyGoal)
+        .filter((i) => i.source === key && !activeTimedPlacement(i) && !i.plannedDay && !isDone(i) && !i.weeklyGoal)
         .sort((a, b) => {
           const br = bucketRank[dueBucketOf(a.due, today)] - bucketRank[dueBucketOf(b.due, today)];
           if (br) return br;
@@ -12176,6 +12637,7 @@ module.exports.__test = {
   detectConferenceUrl, nextBadgeModel, fmtNextCountdown, routineTimedEntries, nextStripMountPoint,
   NEXT_URGENT_MS, NEXT_SECONDS_MS, NEXT_STRIP_LOGO_HOST, NEXT_STRIP_SPLIT_HOST,
   plannerToolbarMountPoint, PLANNER_TOOLBAR_HOST, PLANNER_TOOLBAR_CLASS, PLANNER_TOOLBAR_ICON, PLANNER_TOOLBAR_LABEL,
+  nowRailEventPosition, nowRailState,
   CONFERENCE_URL_PATTERNS,
   plannerPaths, normalizePlannerFolder, detectPlannerFolder, plannerFolderChangePlan, gitignoreLineFor, collectItems,
   zonedToUtc, tzOffsetMinutes, hmToMin, lunchBandHeight,
@@ -12197,7 +12659,9 @@ module.exports.__test = {
   imapUidValidityOf, uidValidityVerdict, imapProbeGoneRaw, emailProbeGone,
   remapByMessageId, remapNotice,
   ghostItemsFor, pruneShadows, normalizeOccurrences, OCCURRENCE_CAP, DONE_SHADOW_MAX_AGE_MS,
-  agendaSections, laneSequence, TRAY_TABS,
+  agendaSections, isUntimedHalfDayItem, laneSequence, TRAY_TABS,
+  plannedStartMinute, plannedDuration, activeTimedPlacement, snapPlannerMinute,
+  clampPlannedDuration, timedGridBounds, timedGridColumns, PLANNER_SLOT_MINUTES,
   todoistFetchOpen, clickupFetchOpen, emailFetchStarred, calendarFetchDefs,
   checklistModel, checklistProgressText, parseLogTable, logRowFor, upsertLogRow, removeLogRow, markerState,
   // weeks (0.14.0): the weekly priorities and the daily highlights
