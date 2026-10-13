@@ -388,7 +388,7 @@ test('SIMULATED: expansion belongs to one routine occurrence, not another date o
   assert.equal(view.routineExpanded.size, 1);
 });
 
-test('SIMULATED: mode changes and step callbacks retain expansion; AGENDA has no collapse control', async () => {
+test('SIMULATED: mode changes and step callbacks retain expansion; a card without a view has no collapse control', async () => {
   const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
   let body = BODY;
   let card;
@@ -430,6 +430,42 @@ test('SIMULATED: mode changes and step callbacks retain expansion; AGENDA has no
   assert.equal(view.routineExpanded.size, 0);
 });
 
+test('SIMULATED: calendar (time-scaled) routine blocks carry the same chevron, steps and per-occurrence state', () => {
+  const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
+  const view = new PlannerBoardView(null, {});
+  const occ = T.routineOccurrence(routine(), '2026-09-07', '13:00');
+  const key = JSON.stringify([occ.routine.path, occ.day]);
+  const card = renderRoutineCard({}, occ, view, true);
+  const toggle = card.children[0].children[0];
+  const steps = card.children[1];
+  assert.equal(toggle.tagName, 'button');
+  assert.equal(card.children[0].children[1].tagName, 'div');
+  assert.equal(steps.hidden, true);
+  assert.equal(steps.checklist.model.rows.length, 3);
+  assert.equal(toggle.fire('pointerdown').stopped, true);
+  const event = toggle.fire('click');
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(event.stopped, true);
+  assert.equal(steps.hidden, false);
+  assert.equal(toggle.attributes['aria-expanded'], 'true');
+  assert.ok(card.className.split(' ').includes('is-open'));
+  assert.equal(view.routineExpanded.has(key), true);
+  const rerendered = renderRoutineCard({}, occ, view, true);
+  assert.equal(rerendered.children[1].hidden, false);
+  const otherDay = T.routineOccurrence(routine(), '2026-09-08', '13:00');
+  assert.equal(renderRoutineCard({}, otherDay, view, true).children[1].hidden, true);
+  toggle.fire('click');
+  assert.equal(steps.hidden, true);
+  assert.equal(view.routineExpanded.size, 0);
+});
+test('SOURCE: the AGENDA tray view owns routineExpanded and passes itself to the routine card', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const start = main.indexOf('class PlannerTrayView extends ItemView');
+  const ctor = main.slice(start, main.indexOf('getViewType()', start));
+  assert.ok(/this\.routineExpanded = new Set\(\);/.test(ctor), 'tray constructor initialises routineExpanded');
+  const agenda = main.slice(main.indexOf('  renderAgenda(el, items, today) {'), main.indexOf('  renderGoals(el, items) {'));
+  assert.ok(/renderRoutineCard\(this\.plugin, entry\.occ, this\)/.test(agenda), 'agenda passes the tray view');
+});
 test('SOURCE: the card is not draggable, the drop line counts it as a position, sync never pushes for it', () => {
   const main = fs.readFileSync(T.__mainPath, 'utf8');
   const card = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));

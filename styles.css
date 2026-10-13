@@ -232,6 +232,10 @@ button.iplan-sync-btn.is-syncing svg {
   padding: 5px 7px 8px;
   overflow: hidden;
 }
+/* Open steps may outgrow the fixed block height; scroll inside it. */
+.iplan-time-routine.is-open { overflow-y: auto; }
+.iplan-time-routine .iplan-routine-kicker { min-width: 0; }
+.iplan-time-routine .iplan-card-title { min-width: 0; }
 .iplan-time-event {
   align-items: flex-start;
   gap: 4px;

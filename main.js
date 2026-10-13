@@ -9349,9 +9349,11 @@ function renderRoutineCard(plugin, occ, view, timeScaled) {
   const time = document.createElement('span');
   time.className = 'iplan-routine-time';
   time.textContent = routineTimeLabel(occ);
-  meta.appendChild(kind);
-  meta.appendChild(time);
-  if (state.ghost) {
+  if (!timeScaled) {
+    meta.appendChild(kind);
+    meta.appendChild(time);
+  }
+  if (state.ghost && !timeScaled) {
     const chip = document.createElement('span');
     chip.className = 'iplan-chip';
     chip.textContent = 'SKIPPED';
@@ -9360,10 +9362,16 @@ function renderRoutineCard(plugin, occ, view, timeScaled) {
   const title = document.createElement('div');
   title.className = 'iplan-card-title';
   title.textContent = routine.name;
-  if (!timeScaled) card.appendChild(meta);
-  card.appendChild(title);
+  // Calendar blocks are short, so the chevron and the name share one row.
+  if (timeScaled) {
+    meta.appendChild(title);
+    card.appendChild(meta);
+  } else {
+    card.appendChild(meta);
+    card.appendChild(title);
+  }
 
-  const steps = !timeScaled && expanded ? document.createElement('div') : null;
+  const steps = expanded ? document.createElement('div') : null;
   if (steps) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
@@ -9372,7 +9380,7 @@ function renderRoutineCard(plugin, occ, view, timeScaled) {
     chevron.className = 'iplan-card-sub-chevron';
     chevron.setAttribute('aria-hidden', 'true');
     toggle.appendChild(chevron);
-    meta.insertBefore(toggle, kind);
+    meta.insertBefore(toggle, timeScaled ? title : kind);
     card.appendChild(steps);
     const paint = () => {
       const label = `${open ? 'Hide' : 'Show'} steps of ${routine.name} on ${occ.day}`;
@@ -9381,6 +9389,7 @@ function renderRoutineCard(plugin, occ, view, timeScaled) {
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
       setIcon(chevron, open ? 'chevron-down' : 'chevron-right');
       steps.hidden = !open;
+      card.classList.toggle('is-open', open);
     };
     toggle.addEventListener('pointerdown', (event) => event.stopPropagation());
     toggle.addEventListener('click', (event) => {
@@ -10930,6 +10939,7 @@ class PlannerTrayView extends ItemView {
     this.activeTab = trayDefaultTab(false);
     this.index = null;          // buildItemIndex, per render
     this.expanded = new Set();  // parent paths whose subtask list is open
+    this.routineExpanded = new Set();
   }
 
   getViewType() { return TRAY_VIEW_TYPE; }
