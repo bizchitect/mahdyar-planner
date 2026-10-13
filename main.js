@@ -34,6 +34,7 @@
 const {
   Plugin, ItemView, PluginSettingTab, Setting, Notice,
   TFile, TFolder, requestUrl, setIcon, normalizePath, Menu, Modal, Platform, moment,
+  MarkdownRenderer, Component,
 } = require('obsidian');
 
 /* ========================================================================== *
@@ -5408,10 +5409,76 @@ function checklistProgressText(done, total) { return `${done} of ${total}`; }
 // so a card can strike itself without waiting for the re-render that
 // follows the write. `progress: false` leaves the "n of m" footer out when
 // the consumer's own head carries the count.
+async function renderRoutineStepLabel(label, text, plugin, sourcePath) {
+  const source = String(text);
+  label.textContent = source;
+  if (/[\r\n]/.test(source)) return;
+  const rendered = document.createElement('div');
+  const component = new Component();
+  component.load();
+  try {
+    await MarkdownRenderer.render(plugin.app,
+      source.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/!/g, '\\!'),
+      rendered, sourcePath, component);
+    if (!label.isConnected) return;
+    const content = document.createDocumentFragment();
+    const copyInline = (node, parent) => {
+      if (node.nodeType === 3) {
+        parent.appendChild(document.createTextNode(node.textContent));
+        return;
+      }
+      const tag = node.tagName.toLowerCase();
+      if (!['p', 'a', 'strong', 'em', 'b', 'i', 'code', 's', 'del', 'span', 'br'].includes(tag)) {
+        throw new Error('Not an inline step');
+      }
+      if (tag === 'p' || tag === 'span') {
+        for (const child of node.childNodes) copyInline(child, parent);
+        return;
+      }
+      const inline = document.createElement(tag);
+      if (tag === 'a') {
+        const href = node.getAttribute('href') || '';
+        const internal = node.classList.contains('internal-link');
+        const target = node.getAttribute('data-href') || href;
+        let safe = false;
+        if (internal) safe = !!target && !/^[a-z][a-z\d+.-]*:/i.test(target);
+        else {
+          try { safe = ['https:', 'http:', 'mailto:'].includes(new URL(href).protocol); }
+          catch { safe = false; }
+        }
+        if (!safe) {
+          parent.appendChild(document.createTextNode(node.textContent));
+          return;
+        }
+        inline.className = internal ? 'internal-link' : 'external-link';
+        inline.setAttribute('href', internal ? target : href);
+        if (internal) inline.setAttribute('data-href', target);
+        else inline.setAttribute('rel', 'noopener noreferrer');
+        inline.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (internal) plugin.app.workspace.openLinkText(target, sourcePath, event.ctrlKey || event.metaKey);
+          else window.open(href, '_external');
+        });
+      }
+      for (const child of node.childNodes) copyInline(child, inline);
+      parent.appendChild(inline);
+    };
+    const paragraphs = Array.from(rendered.children);
+    if (paragraphs.length !== 1 || paragraphs[0].tagName.toLowerCase() !== 'p') return;
+    copyInline(paragraphs[0], content);
+    if (label.isConnected) label.replaceChildren(content);
+  } catch {
+    if (label.isConnected) label.textContent = source;
+  } finally {
+    component.unload();
+  }
+}
+
 function renderChecklist(container, model, opts) {
   const o = opts || {};
   const block = document.createElement('div');
-  block.className = `iplan-checklist${o.compact ? ' is-compact' : ''}`;
+  block.className = `iplan-checklist${o.compact ? ' is-compact' : ''}${o.routineLabels ? ' iplan-routine-steps' : ''}`;
   block.setAttribute('role', 'group');
   if (o.ariaLabel) block.setAttribute('aria-label', o.ariaLabel);
   const state = { done: model.done, total: model.total };
@@ -5421,44 +5488,62 @@ function renderChecklist(container, model, opts) {
     progress.textContent = checklistProgressText(state.done, state.total);
     if (typeof o.onProgress === 'function') o.onProgress(state.done, state.total);
   };
-  const paint = (row, checked) => {
-    row.setAttribute('aria-checked', checked ? 'true' : 'false');
+  const paint = (row, checked, control) => {
+    if (!o.routineLabels) row.setAttribute('aria-checked', checked ? 'true' : 'false');
     row.classList.toggle('is-checked', checked);
+    if (control && control !== row) control.checked = checked;
   };
   for (const r of model.rows) {
-    const row = document.createElement('button');
-    row.type = 'button';
+    const row = document.createElement(o.routineLabels ? 'div' : 'button');
+    if (!o.routineLabels) row.type = 'button';
     row.className = `iplan-checklist-row${r.missed ? ' is-missed' : ''}`;
-    row.setAttribute('role', 'checkbox');
+    if (!o.routineLabels) row.setAttribute('role', 'checkbox');
     row.setAttribute('data-id', r.id);
-    paint(row, r.checked);
     if (r.disabled) row.setAttribute('aria-disabled', 'true');
-    const check = document.createElement('span');
+    const hitTarget = o.routineLabels ? document.createElement('label') : row;
+    if (o.routineLabels) hitTarget.className = 'iplan-routine-step-check';
+    const check = document.createElement(o.routineLabels ? 'input' : 'span');
     check.className = 'iplan-check';
-    check.setAttribute('aria-hidden', 'true');
+    if (o.routineLabels) {
+      check.type = 'checkbox';
+      check.disabled = r.disabled;
+      check.setAttribute('aria-label', r.label);
+      hitTarget.appendChild(check);
+      row.appendChild(hitTarget);
+      hitTarget.addEventListener('click', (event) => event.stopPropagation());
+    } else {
+      check.setAttribute('aria-hidden', 'true');
+      row.appendChild(check);
+    }
+    const control = o.routineLabels ? check : row;
+    paint(row, r.checked, control);
     const label = document.createElement('span');
     label.className = 'iplan-checklist-label';
     label.textContent = r.label;
-    row.appendChild(check);
     row.appendChild(label);
+    if (o.routineLabels) {
+      for (const name of ['click', 'pointerdown', 'keydown']) {
+        row.addEventListener(name, (event) => event.stopPropagation());
+      }
+    }
     if (r.meta) {
       const chip = document.createElement('span');
       chip.className = 'iplan-chip';
       chip.textContent = r.meta;
       row.appendChild(chip);
     }
-    row.addEventListener('click', (e) => {
+    control.addEventListener(o.routineLabels ? 'change' : 'click', (e) => {
       // The card behind the row opens its note on click; a check is not that.
-      e.preventDefault();
+      if (!o.routineLabels) e.preventDefault();
       e.stopPropagation();
       if (row.getAttribute('aria-disabled') === 'true') return;
-      const was = row.getAttribute('aria-checked') === 'true';
+      const was = o.routineLabels ? row.classList.contains('is-checked') : row.getAttribute('aria-checked') === 'true';
       const next = !was;
-      paint(row, next);
+      paint(row, next, control);
       state.done += next ? 1 : -1;
       tell();
       const revert = () => {
-        paint(row, was);
+        paint(row, was, control);
         state.done += next ? -1 : 1;
         tell();
       };
@@ -5479,6 +5564,16 @@ function renderChecklist(container, model, opts) {
   progress.textContent = checklistProgressText(state.done, state.total);
   if (o.progress !== false) block.appendChild(progress);
   container.appendChild(block);
+  if (o.routineLabels) {
+    model.rows.forEach((row, index) => {
+      const step = block.children[index];
+      const label = step.querySelector('.iplan-checklist-label');
+      renderRoutineStepLabel(label, row.label, o.routineLabels.plugin, o.routineLabels.sourcePath)
+        .then(() => {
+          if (label.isConnected) step.querySelector('input').setAttribute('aria-label', label.textContent);
+        });
+    });
+  }
   return block;
 }
 
@@ -9485,7 +9580,7 @@ function renderHabitsBlock(plugin, occs, day, today, view) {
   return block;
 }
 
-function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded) {
+function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded, hideTitle = false) {
   const state = routineCardState(occ);
   const routine = occ.routine;
   const shortBlock = timeScaled && occ.endMin - occ.startMin <= 30;
@@ -9543,7 +9638,7 @@ function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded) {
     card.appendChild(meta);
   } else {
     card.appendChild(meta);
-    card.appendChild(title);
+    if (!hideTitle) card.appendChild(title);
   }
 
   const steps = !timeScaled && expanded ? document.createElement('div') : null;
@@ -9584,6 +9679,7 @@ function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded) {
     });
     renderChecklist(steps, model, {
       ariaLabel: `${routine.name}, ${routineKicker(occ).toLowerCase()} steps`,
+      routineLabels: { plugin, sourcePath: routine.path },
       onToggle: (id, next) => plugin.toggleRoutineStep(routine.path, occ.day, Number(id), next, occ.total),
       onProgress: (done, total) => card.classList.toggle('is-done', total > 0 && done === total),
     });
@@ -9646,7 +9742,8 @@ class RoutineDetailModal extends Modal {
       JSON.stringify([occurrence.routine.path, occurrence.day])));
     for (const occurrence of this.occurrences) {
       contentEl.createDiv({ cls: 'iplan-event-modal-row-value', text: `${occurrence.day}, ${routineTimeLabel(occurrence)}` });
-      contentEl.appendChild(renderRoutineCard(this.plugin, occurrence, this.view, false, this.routineExpanded));
+      contentEl.appendChild(renderRoutineCard(this.plugin, occurrence, this.view, false, this.routineExpanded,
+        !overflow && this.occurrences.length === 1));
     }
     contentEl.querySelector('.iplan-card-sub-toggle').focus();
   }

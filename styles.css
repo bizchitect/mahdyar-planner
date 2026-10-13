@@ -1313,6 +1313,90 @@ ul.iplan-settings-list li { margin: 3px 0; }
 }
 .iplan-checklist.is-compact button.iplan-checklist-row { font-size: 11px; padding: 2px 4px 2px 2px; }
 
+.iplan-routine-steps .iplan-checklist-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--size-4-2);
+  padding: var(--size-2-1) 0;
+  font-family: var(--iplan-display);
+  font-size: var(--font-smallest);
+  line-height: var(--line-height-normal);
+  color: var(--iplan-paper);
+  cursor: default;
+}
+.iplan-routine-steps .iplan-checklist-label {
+  display: block;
+  margin: 0;
+  padding: 0;
+  line-height: inherit;
+  white-space: pre-line;
+  cursor: default;
+  overflow-wrap: anywhere;
+}
+.iplan-routine-steps .is-checked .iplan-checklist-label {
+  text-decoration: line-through;
+  color: var(--iplan-faint);
+}
+.iplan-routine-steps .iplan-checklist-label :is(p, a, strong, em, b, i, code, s, del, span) {
+  display: inline;
+  margin-block: 0;
+  padding-block: 0;
+  line-height: inherit;
+}
+.iplan-routine-steps .iplan-routine-step-check {
+  display: inline-flex;
+  flex: 0 0 auto;
+  font: inherit;
+  align-items: center;
+  justify-content: center;
+  height: 1lh;
+  min-width: calc(1em + var(--size-4-2));
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 var(--size-2-1);
+  line-height: inherit;
+  cursor: pointer;
+}
+.iplan-root .iplan-routine-steps .iplan-checklist-row input.iplan-check,
+.iplan-tray-root .iplan-routine-steps .iplan-checklist-row input.iplan-check {
+  appearance: none;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border-color: var(--iplan-dim);
+  cursor: pointer;
+}
+.iplan-root .iplan-routine-steps input.iplan-check:checked,
+.iplan-tray-root .iplan-routine-steps input.iplan-check:checked {
+  background: var(--iplan-success);
+  border-color: var(--iplan-success);
+}
+.iplan-root .iplan-routine-steps .iplan-routine-step-check:hover input.iplan-check:not(:disabled),
+.iplan-tray-root .iplan-routine-steps .iplan-routine-step-check:hover input.iplan-check:not(:disabled) {
+  border-color: var(--iplan-success);
+}
+.iplan-routine-steps .iplan-checklist-row[aria-disabled="true"] { color: var(--iplan-faint); }
+.iplan-routine-steps .iplan-checklist-row[aria-disabled="true"] .iplan-routine-step-check,
+.iplan-root .iplan-routine-steps input.iplan-check:disabled,
+.iplan-tray-root .iplan-routine-steps input.iplan-check:disabled { cursor: default; }
+.iplan-routine-steps .iplan-checklist-label a[href] {
+  cursor: pointer;
+  color: var(--link-color);
+  text-decoration: underline;
+  text-decoration-thickness: var(--link-decoration-thickness);
+}
+.iplan-routine-steps .iplan-checklist-label a[href]:hover { color: var(--link-color-hover); }
+.iplan-routine-steps :is(input.iplan-check, a[href]):focus-visible {
+  outline: 2px solid var(--iplan-marker);
+  outline-offset: 2px;
+}
+@media (any-pointer: coarse) {
+  .iplan-routine-steps .iplan-routine-step-check {
+    min-width: 44px;
+  }
+}
+
 /* ------------------------------------------- weekday row and the modal -- */
 .iplan-weekdays { margin-right: 0; }
 .iplan-settings .iplan-weekdays button.iplan-seg-btn { min-width: 20px; text-align: center; }

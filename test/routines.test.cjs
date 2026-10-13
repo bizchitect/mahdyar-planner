@@ -668,19 +668,29 @@ test('the routines folder derives from the planner folder and is created with th
   assert.ok(/await mk\(p\.routines\);/.test(main), 'ensureFolders creates Routines/');
 });
 
-function routineCardFixture() {
+function routineCardFixture(markdownRender) {
   const main = fs.readFileSync(T.__mainPath, 'utf8');
   const renderer = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
+  const checklist = markdownRender ? main.slice(main.indexOf('async function renderRoutineStepLabel('),
+    main.indexOf('/* ---- the sentinel log table')) : '';
   const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
   const scale = main.match(/const PLANNER_PIXELS_PER_MINUTE\s*=[^;]+;/)[0];
   const openedModals = [];
+  const openedLinks = [];
+  const components = [];
   const computedStyle = (node) => ({ paddingLeft: '8px', paddingRight: '8px', fontSize: '12px',
     display: node.style.display || 'block', visibility: node.style.visibility || 'visible',
     ...node.computedStyle });
   const element = (tagName) => {
-    const node = { tagName, children: [], attributes: {}, listeners: {}, className: '', hidden: false, dataset: {}, style: {}, isConnected: true };
+    const node = { tagName, nodeType: 1, children: [], attributes: {}, listeners: {}, className: '', hidden: false, dataset: {}, style: {}, isConnected: true };
+    Object.defineProperty(node, 'childNodes', { get: () => node.children });
+    Object.defineProperty(node, 'textContent', {
+      get: () => (node.ownText || '') + node.children.map((child) => child.textContent).join(''),
+      set: (value) => { node.empty(); node.ownText = String(value); },
+    });
     node.classList = {
       add: (...names) => { for (const name of names) if (!node.className.split(' ').includes(name)) node.className += ` ${name}`; },
+      contains: (name) => node.className.split(' ').includes(name),
       toggle: (name, enabled) => {
         node.className = node.className.split(' ').filter((value) => value !== name).join(' ');
         if (enabled) node.classList.add(name);
@@ -688,7 +698,13 @@ function routineCardFixture() {
     };
     node.setAttribute = (name, value) => { node.attributes[name] = value; };
     node.getAttribute = (name) => node.attributes[name];
-    node.appendChild = (child) => { child.parentElement = node; node.children.push(child); return child; };
+    node.appendChild = (child) => {
+      if (child.nodeType === 11) {
+        for (const entry of [...child.children]) node.appendChild(entry);
+        child.children = [];
+      } else { child.parentElement = node; node.children.push(child); }
+      return child;
+    };
     node.insertBefore = (child, before) => { child.parentElement = node; node.children.splice(node.children.indexOf(before), 0, child); };
     node.matches = (selector) => selector === ':disabled' && !!node.disabled;
     node.getClientRects = () => {
@@ -700,7 +716,9 @@ function routineCardFixture() {
     node.addClass = (...names) => node.classList.add(...names);
     node.style.setProperty = (name, value) => { node.style[name] = value; };
     node.focus = () => { node.focused = true; };
-    node.empty = () => { node.children = []; };
+    node.disconnect = () => { node.isConnected = false; for (const child of node.children) child.disconnect(); };
+    node.empty = () => { for (const child of node.children) child.disconnect(); node.children = []; node.ownText = ''; };
+    node.replaceChildren = (...children) => { node.empty(); for (const child of children) node.appendChild(child); };
     node.createEl = (tag, options = {}) => {
       const child = element(tag);
       child.className = options.cls || '';
@@ -713,9 +731,12 @@ function routineCardFixture() {
     node.createSpan = (options) => node.createEl('span', options);
     node.querySelector = (selector) => {
       const classMatch = /^\.([\w-]+)/.exec(selector);
+      const tagMatch = /^[a-z][\w-]*/i.exec(selector);
       const attributeMatch = /\[([\w-]+)="(.*)"\]/.exec(selector);
       for (const child of node.children) {
-        if ((!classMatch || child.className.split(' ').includes(classMatch[1]))
+        if (child.nodeType !== 1) continue;
+        if ((!tagMatch || child.tagName.toLowerCase() === tagMatch[0].toLowerCase())
+          && (!classMatch || child.className.split(' ').includes(classMatch[1]))
           && (!attributeMatch || child.attributes[attributeMatch[1]] === attributeMatch[2])) return child;
         const nested = child.querySelector(selector);
         if (nested) return nested;
@@ -738,12 +759,34 @@ function routineCardFixture() {
       node.listeners[name](event);
       return event;
     };
+    node.dispatch = (name, values = {}) => {
+      const event = { target: node, defaultPrevented: false, stopped: false, ...values,
+        preventDefault() { this.defaultPrevented = true; },
+        stopPropagation() { this.stopped = true; } };
+      for (let current = node; current && !event.stopped; current = current.parentElement) {
+        if (current.listeners[name]) current.listeners[name](event);
+      }
+      return event;
+    };
     return node;
   };
-  return vm.runInNewContext(`${scale}\n${renderer}\n${board}\n({ renderRoutineCard, PlannerBoardView, RoutineDetailModal, element, openedModals, PLANNER_PIXELS_PER_MINUTE })`, {
+  return vm.runInNewContext(`${scale}\n${checklist}\n${renderer}\n${board}\n({ renderRoutineCard, PlannerBoardView, RoutineDetailModal, element, openedModals, openedLinks, components, PLANNER_PIXELS_PER_MINUTE${markdownRender ? ', renderChecklist, renderRoutineStepLabel' : ''} })`, {
     Set, Map, ItemView: class {
       constructor(leaf) { this.leaf = leaf || {}; this.leaf.view = this; }
-    }, element, openedModals, document: { createElement: element },
+    }, element, openedModals, openedLinks, components, URL,
+    document: {
+      createElement: element,
+      createTextNode: (text) => { const node = element('#text'); node.nodeType = 3; node.textContent = text; return node; },
+      createDocumentFragment: () => { const node = element('#fragment'); node.nodeType = 11; return node; },
+    },
+    Component: class {
+      constructor() { components.push(this); }
+      load() { this.loaded = true; }
+      unload() { this.unloaded = true; }
+    },
+    MarkdownRenderer: { render: markdownRender },
+    window: { open: (...args) => openedLinks.push(args) },
+    Notice: class {}, checklistProgressText: T.checklistProgressText,
     getComputedStyle: computedStyle,
     Modal: class {
       constructor() { this.contentEl = element('div'); }
@@ -765,6 +808,280 @@ function routineCardFixture() {
     wireLongPress: () => {},
   });
 }
+
+test('SIMULATED: routine Markdown output is inline and safe, with separate link and checkbox activation', async () => {
+  const source = 'Check [Action Items](https://example.com/actions) of today';
+  const renderCalls = [];
+  const fixture = routineCardFixture(async (app, markdown, rendered, sourcePath, component) => {
+    renderCalls.push({ app, markdown, sourcePath, component });
+    const paragraph = rendered.createEl('p');
+    paragraph.appendChild(fixture.element('span')).textContent = 'Check ';
+    paragraph.createEl('a', { cls: 'external-link', text: 'Action Items', attr: { href: 'https://example.com/actions' } });
+    paragraph.createEl('span', { text: ' of today' });
+  });
+  const { element, renderChecklist, openedLinks, components } = fixture;
+  const container = element('div');
+  let cardClicks = 0;
+  container.addEventListener('click', () => { cardClicks += 1; });
+  const calls = [];
+  const plugin = { app: {} };
+  const block = renderChecklist(container, T.checklistModel({ rows: [{ id: 1, label: source }] }), {
+    routineLabels: { plugin, sourcePath: '02 Planner/Routines/Morning.md' },
+    onToggle: (...args) => calls.push(args),
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  const row = block.children[0];
+  const check = row.querySelector('input');
+  const label = row.querySelector('.iplan-checklist-label');
+  const link = label.querySelector('a');
+  assert.equal(row.tagName, 'div');
+  assert.equal(row.attributes.role, undefined);
+  assert.equal(check.type, 'checkbox');
+  assert.equal(check.attributes['aria-label'], 'Check Action Items of today');
+  assert.equal(label.textContent, 'Check Action Items of today');
+  assert.equal(label.querySelector('p'), null);
+  assert.equal(link.textContent, 'Action Items');
+  assert.equal(link.attributes.href, 'https://example.com/actions');
+  assert.equal(row.children[0].tagName, 'label');
+  assert.equal(row.children[0].children.length, 1);
+  assert.equal(check.checked, false);
+  assert.deepEqual(openedLinks, []);
+  assert.deepEqual(calls, []);
+  assert.equal(label.dispatch('click').defaultPrevented, false);
+  assert.equal(check.dispatch('keydown', { key: ' ' }).defaultPrevented, false);
+  assert.equal(link.dispatch('keydown', { key: 'Enter' }).defaultPrevented, false);
+  assert.deepEqual(calls, []);
+  const activation = link.dispatch('click');
+  assert.equal(activation.defaultPrevented, true);
+  assert.equal(activation.stopped, true);
+  assert.deepEqual(openedLinks, [['https://example.com/actions', '_external']]);
+  assert.deepEqual(calls, []);
+  assert.equal(cardClicks, 0);
+  check.checked = true;
+  check.dispatch('change');
+  assert.deepEqual(calls, [['1', true]]);
+  assert.equal(check.checked, true);
+  assert.equal(row.classList.contains('is-checked'), true);
+  assert.equal(block.children.at(-1).textContent, '1 of 1');
+  assert.equal(renderCalls[0].markdown, source);
+  assert.equal(renderCalls[0].sourcePath, '02 Planner/Routines/Morning.md');
+  assert.equal(components[0].loaded, true);
+  assert.equal(components[0].unloaded, true);
+});
+
+test('SIMULATED: internal links navigate relative to the routine, and bare URLs keep renderer labels', async () => {
+  for (const internal of [true, false]) {
+    const fixture = routineCardFixture(async (_app, _markdown, rendered) => {
+      rendered.createEl('p').createEl('a', { cls: internal ? 'internal-link' : 'external-link',
+        text: internal ? 'Daily note' : 'https://example.com',
+        attr: internal ? { href: 'Daily#Today', 'data-href': 'Daily#Today' } : { href: 'https://example.com' } });
+    });
+    const navigation = [];
+    const plugin = { app: { workspace: { openLinkText: (...args) => navigation.push(args) } } };
+    const label = fixture.element('span');
+    await fixture.renderRoutineStepLabel(label, internal ? '[[Daily#Today|Daily note]]' : 'https://example.com',
+      plugin, '02 Planner/Routines/Morning.md');
+    const link = label.querySelector('a');
+    link.dispatch('click', { ctrlKey: true });
+    if (internal) {
+      assert.deepEqual(navigation, [['Daily#Today', '02 Planner/Routines/Morning.md', true]]);
+      assert.deepEqual(fixture.openedLinks, []);
+    } else {
+      assert.equal(link.textContent, 'https://example.com');
+      assert.deepEqual(fixture.openedLinks, [['https://example.com', '_external']]);
+      assert.deepEqual(navigation, []);
+    }
+  }
+});
+
+test('SIMULATED: malformed/plain step text stays text and unsafe rendered destinations never become links', async () => {
+  for (const source of ['Water & rest', 'Check [unfinished](today', '<img src=x onerror=alert(1)>', 'First\nSecond']) {
+    const markdownInputs = [];
+    const fixture = routineCardFixture(async (_app, markdown, rendered) => {
+      markdownInputs.push(markdown);
+      rendered.createEl('p', { text: source });
+    });
+    const label = fixture.element('span');
+    await fixture.renderRoutineStepLabel(label, source, { app: {} }, 'Routine.md');
+    assert.equal(label.textContent, source);
+    assert.equal(label.querySelector('a'), null);
+    assert.equal(label.querySelector('img'), null);
+    if (source.includes('\n')) assert.equal(markdownInputs.length, 0);
+    if (source.startsWith('<')) assert.equal(markdownInputs[0], '&lt;img src=x onerror=alert(1)&gt;');
+  }
+  for (const href of ['javascript:alert(1)', 'data:text/html,hello', 'file:///tmp/example', 'vbscript:msgbox(1)']) {
+    const fixture = routineCardFixture(async (_app, _markdown, rendered) => {
+      rendered.createEl('p').createEl('a', { text: 'Unsafe', attr: { href } });
+    });
+    const label = fixture.element('span');
+    await fixture.renderRoutineStepLabel(label, `[Unsafe](${href})`, { app: {} }, 'Routine.md');
+    assert.equal(label.textContent, 'Unsafe');
+    assert.equal(label.querySelector('a'), null);
+    assert.deepEqual(fixture.openedLinks, []);
+  }
+});
+
+test('SIMULATED: closed labels reject late rendering, unload components and preserve text on failure or block markup', async () => {
+  let finish;
+  const fixture = routineCardFixture((_app, _markdown, rendered) => new Promise((resolve) => {
+    finish = () => { rendered.createEl('p', { text: 'Late' }); resolve(); };
+  }));
+  const label = fixture.element('span');
+  const pending = fixture.renderRoutineStepLabel(label, 'Original', { app: {} }, 'Routine.md');
+  label.disconnect();
+  finish();
+  await pending;
+  assert.equal(label.textContent, 'Original');
+  assert.equal(fixture.components[0].unloaded, true);
+  for (const renderer of [async () => { throw new Error('render failed'); },
+    async (_app, _markdown, rendered) => { rendered.createEl('h1', { text: 'Heading' }); }]) {
+    const failed = routineCardFixture(renderer);
+    const text = failed.element('span');
+    await failed.renderRoutineStepLabel(text, '# Original', { app: {} }, 'Routine.md');
+    assert.equal(text.textContent, '# Original');
+    assert.equal(failed.components[0].unloaded, true);
+  }
+});
+
+test('SIMULATED: routine checkbox writes revert on refusal, disabled boxes stay inert, other checklists keep button rows', async () => {
+  const fixture = routineCardFixture(async (_app, markdown, rendered) => { rendered.createEl('p', { text: markdown }); });
+  const container = fixture.element('div');
+  let writes = 0;
+  const block = fixture.renderChecklist(container, T.checklistModel({ rows: [
+    { id: 1, label: 'Water' }, { id: 2, label: 'Skipped', disabled: true },
+  ] }), { routineLabels: { plugin: { app: {} }, sourcePath: 'Routine.md' },
+    onToggle: async () => { writes += 1; return false; } });
+  const check = block.children[0].querySelector('input');
+  check.checked = true;
+  check.dispatch('change');
+  await Promise.resolve();
+  assert.equal(writes, 1);
+  assert.equal(check.checked, false);
+  assert.equal(block.children[0].classList.contains('is-checked'), false);
+  const disabled = block.children[1].querySelector('input');
+  assert.equal(disabled.disabled, true);
+  disabled.dispatch('change');
+  assert.equal(writes, 1);
+  const ordinary = fixture.renderChecklist(container, T.checklistModel({ rows: [{ id: 3, label: '[Raw](text)' }] }),
+    { onToggle: () => { writes += 1; } });
+  assert.equal(ordinary.children[0].tagName, 'button');
+  assert.equal(ordinary.children[0].attributes.role, 'checkbox');
+  assert.equal(ordinary.children[0].querySelector('.iplan-checklist-label').textContent, '[Raw](text)');
+  ordinary.children[0].dispatch('click');
+  assert.equal(writes, 2);
+  assert.equal(ordinary.children[0].attributes['aria-checked'], 'true');
+});
+
+test('SIMULATED: overview and expanded calendar details share routine labels without rewriting step definitions', async () => {
+  const source = 'Check [Action Items](https://example.com/actions) of today';
+  const fixture = routineCardFixture(async (_app, _markdown, rendered) => {
+    rendered.createEl('p').createEl('a', { text: 'Action Items', attr: { href: 'https://example.com/actions' } });
+  });
+  const body = BODY.replace('Water, 500 ml', source);
+  const occ = T.routineOccurrence(routine({}, body), '2026-09-07', '13:00');
+  const writes = [];
+  const plugin = { app: {}, manifest: { id: 'mahdyar-planner' }, toggleRoutineStep: (...args) => writes.push(args) };
+  const view = new fixture.PlannerBoardView(null, plugin);
+  view.contentEl = fixture.element('div');
+  view.render = () => {};
+  view.routineExpanded.add(JSON.stringify([occ.routine.path, occ.day]));
+  const overview = view.contentEl.appendChild(fixture.renderRoutineCard(plugin, occ, view));
+  const modal = new fixture.RoutineDetailModal(plugin, occ, view, null);
+  modal.open();
+  await Promise.resolve();
+  await Promise.resolve();
+  for (const surface of [overview, modal.contentEl]) {
+    const label = surface.querySelector('.iplan-checklist-label');
+    assert.equal(label.querySelector('a').textContent, 'Action Items');
+    assert.equal(surface.querySelector('.iplan-routine-steps').children[0].tagName, 'div');
+    label.querySelector('a').dispatch('click');
+  }
+  assert.equal(modal.contentEl.querySelector('.iplan-card-sub-toggle').attributes['aria-expanded'], 'true');
+  assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
+  assert.deepEqual(writes, []);
+  assert.equal(occ.steps[0].label, source);
+  assert.equal(occ.routine.steps[0].label, source);
+  assert.equal(body.includes(`- [ ] ${source}`), true);
+  modal.close();
+});
+
+test('SIMULATED: plain, linked and multiline routine labels share separate first-line checkbox structure', async () => {
+  const sources = ['Water', '[A long link that can wrap onto another line](https://example.com)', 'First\nSecond'];
+  const fixture = routineCardFixture(async (_app, markdown, rendered) => {
+    const paragraph = rendered.createEl('p');
+    if (markdown === sources[1]) {
+      paragraph.createEl('a', { text: 'A long link that can wrap onto another line',
+        attr: { href: 'https://example.com' } }).createEl('br');
+    } else paragraph.textContent = markdown;
+  });
+  const block = fixture.renderChecklist(fixture.element('div'), T.checklistModel({
+    rows: sources.map((label, index) => ({ id: index, label })),
+  }), { routineLabels: { plugin: { app: {} }, sourcePath: 'Routine.md' }, progress: false });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(block.classList.contains('iplan-routine-steps'), true);
+  for (const row of block.children) {
+    assert.equal(row.tagName, 'div');
+    assert.equal(row.children.length, 2);
+    assert.equal(row.children[0].className, 'iplan-routine-step-check');
+    assert.equal(row.children[0].children.length, 1);
+    assert.equal(row.children[0].children[0].type, 'checkbox');
+    assert.equal(row.children[1].className, 'iplan-checklist-label');
+    assert.equal(row.children[1].querySelector('input'), null);
+    assert.equal(row.children[1].querySelector('p'), null);
+  }
+  assert.equal(block.children[0].children[1].textContent, sources[0]);
+  assert.ok(block.children[1].children[1].querySelector('a').querySelector('br'));
+  assert.equal(block.children[2].children[1].textContent, sources[2]);
+});
+
+test('SOURCE: routines opt into one Markdown renderer with scoped text, checkbox and link cursor rules', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const renderer = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
+  assert.ok(renderer.includes('routineLabels: { plugin, sourcePath: routine.path }'));
+  const helper = main.slice(main.indexOf('async function renderRoutineStepLabel('), main.indexOf('function renderChecklist('));
+  assert.match(helper, /await MarkdownRenderer\.render\(plugin\.app,/);
+  assert.match(helper, /component\.load\(\)/);
+  assert.match(helper, /finally\s*\{\s*component\.unload\(\)/);
+  assert.doesNotMatch(helper, /innerHTML|insertAdjacentHTML|requestUrl|fetch\(/);
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  for (const selector of ['.iplan-routine-steps .iplan-checklist-row', '.iplan-routine-steps .iplan-checklist-label']) {
+    const rule = css.slice(css.indexOf(`${selector} {`)).split('}')[0];
+    assert.match(rule, /cursor:\s*default/);
+    assert.doesNotMatch(rule, /cursor:\s*pointer/);
+  }
+  const checkRule = css.slice(css.indexOf('.iplan-routine-steps .iplan-routine-step-check {')).split('}')[0];
+  assert.match(checkRule, /cursor:\s*pointer/);
+  assert.match(checkRule, /font:\s*inherit/);
+  assert.match(checkRule, /height:\s*1lh;/);
+  assert.match(checkRule, /align-items:\s*center/);
+  assert.match(checkRule, /margin:\s*0;/);
+  assert.match(checkRule, /padding:\s*0 var\(--size-2-1\);/);
+  const rowRule = css.slice(css.indexOf('.iplan-routine-steps .iplan-checklist-row {')).split('}')[0];
+  assert.match(rowRule, /align-items:\s*flex-start/);
+  const labelRule = css.slice(css.indexOf('.iplan-routine-steps .iplan-checklist-label {')).split('}')[0];
+  assert.match(labelRule, /margin:\s*0;/);
+  assert.match(labelRule, /padding:\s*0;/);
+  assert.match(labelRule, /line-height:\s*inherit/);
+  assert.match(labelRule, /white-space:\s*pre-line/);
+  const inlineRule = css.slice(css.indexOf('.iplan-routine-steps .iplan-checklist-label :is(')).split('}')[0];
+  assert.match(inlineRule, /:is\(p, a, strong, em, b, i, code, s, del, span\)/);
+  assert.match(inlineRule, /display:\s*inline/);
+  assert.match(inlineRule, /margin-block:\s*0;/);
+  assert.match(inlineRule, /padding-block:\s*0;/);
+  assert.match(inlineRule, /line-height:\s*inherit/);
+  const coarseRule = css.slice(css.indexOf('@media (any-pointer: coarse) {', css.indexOf(checkRule))).split('}')[0];
+  assert.match(coarseRule, /min-width:\s*44px/);
+  assert.doesNotMatch(coarseRule, /min-height|padding|align-items/);
+  assert.match(css, /\.iplan-routine-steps input\.iplan-check:checked\s*\{[^}]*background:\s*var\(--iplan-success\)/);
+  assert.match(css, /\.iplan-routine-step-check:hover input\.iplan-check:not\(:disabled\)/);
+  assert.match(css, /\.iplan-routine-steps :is\(input\.iplan-check, a\[href\]\):focus-visible/);
+  const linkRule = css.slice(css.indexOf('.iplan-routine-steps .iplan-checklist-label a[href] {')).split('}')[0];
+  assert.match(linkRule, /cursor:\s*pointer/);
+  assert.match(linkRule, /color:\s*var\(--link-color\)/);
+  assert.match(linkRule, /text-decoration:\s*underline/);
+});
 
 test('SIMULATED: board routines start collapsed and the button paints both toggle states', () => {
   const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
@@ -847,6 +1164,7 @@ test('SIMULATED: mode changes and step callbacks retain expansion; a card withou
   const agenda = renderRoutineCard(plugin, T.routineOccurrence(routine({}, body), day, '13:00'), null);
   assert.equal(agenda.hidden, false);
   assert.equal(agenda.children.length, 2);
+  assert.equal(agenda.querySelector('.iplan-card-title').textContent, 'Morning launch');
   assert.equal(agenda.children[0].children[0].tagName, 'span');
   assert.equal(agenda.querySelector('.iplan-card-sub-toggle'), null);
   assert.equal(view.routineExpanded.size, 0);
@@ -864,6 +1182,7 @@ test('SIMULATED: every calendar bar and title opens details without calendar che
     view.routineExpanded.add(key);
     const card = renderRoutineCard(plugin, occ, view, true);
     const title = card.querySelector('.iplan-routine-detail-button');
+    assert.equal(title.textContent, occ.routine.name);
     assert.equal(card.querySelector('.iplan-card-sub-toggle'), null);
     assert.equal(card.querySelector('.iplan-card-sub-chevron'), null);
     assert.equal(card.children.length, end === '09:15' ? 1 : 2);
@@ -941,9 +1260,13 @@ test('SIMULATED: details reopen expanded independently, keep step callbacks and 
         assert.equal(modal.contentEl.children.length, 3);
         assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
         assert.equal(modal.contentEl.children[1].textContent, '2026-09-07, 09:00 - 09:15');
+        assert.equal(modal.contentEl.querySelector('.iplan-event-modal-title').textContent, occ.routine.name);
+        assert.equal(modal.contentEl.querySelector('.iplan-card-title'), null);
         const card = modal.contentEl.children[2];
         const toggle = card.children[0].children[0];
-        const steps = card.children[2];
+        const steps = card.children[1];
+        assert.equal(card.children[0].children[1].textContent, T.routineKicker(occ));
+        assert.equal(card.children[0].children[2].textContent, T.routineTimeLabel(occ));
         assert.equal(steps.hidden, false);
         assert.equal(toggle.attributes['aria-expanded'], 'true');
         assert.equal(toggle.focused, true);
@@ -960,6 +1283,27 @@ test('SIMULATED: details reopen expanded independently, keep step callbacks and 
         assert.equal(view.contentEl.querySelector(selector).focused, true);
         assert.equal(view.contentEl.querySelector('.iplan-card-sub-toggle'), null);
       }
+    }
+  }
+});
+
+test('SIMULATED: overflow dialogs retain each routine name even with only one remaining occurrence', () => {
+  const { RoutineDetailModal, element } = routineCardFixture();
+  const plugin = { app: {}, manifest: { id: 'mahdyar-planner' } };
+  const day = '2026-09-07';
+  const occurrences = ['Daily planning', 'Other routine'].map((name, index) =>
+    T.routineOccurrence(routine({ name }, null, `Routine ${index}.md`), day, '13:00'));
+  for (const count of [1, 2]) {
+    const opener = element('button');
+    opener.className = 'iplan-routine-label-overflow';
+    const modal = new RoutineDetailModal(plugin, occurrences.slice(0, count), null, opener);
+    modal.open();
+    assert.equal(modal.contentEl.querySelector('.iplan-event-modal-title').textContent, `More routines on ${day}`);
+    for (const [index, occurrence] of occurrences.slice(0, count).entries()) {
+      const card = modal.contentEl.children[2 + index * 2];
+      assert.equal(card.querySelector('.iplan-card-title').textContent, occurrence.routine.name);
+      assert.equal(card.querySelector('.iplan-card-sub-toggle').attributes['aria-expanded'], 'true');
+      assert.equal(card.children[2].hidden, false);
     }
   }
 });
