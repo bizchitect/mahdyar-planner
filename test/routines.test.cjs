@@ -46,6 +46,370 @@ const BODY = [
 
 const routine = (fm, body, p) => T.parseRoutineNote(Object.assign({}, FM, fm || {}), body == null ? BODY : body, p || '02 Planner/Routines/Morning launch.md');
 
+test('daily planned time uses free time as the buffer percentage denominator', () => {
+  const day = '2026-09-07';
+  const events = [{ start: `${day}T09:00:00`, end: `${day}T11:00:00` }];
+  const items = [{ source: 'todoist', recurring: false, plannedDay: day,
+    plannedStart: '11:00', plannedDuration: 120 }];
+  const occurrences = T.routineOccurrences([routine()], day, '13:00');
+  assert.deepEqual(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, items, occurrences), {
+    dayMin: 600, lunchMin: 0, meetingsMin: 120, plannedMin: 180, freeMin: 480,
+    bufferMin: 300, bufferPercent: 62.5, unknownTasks: 0,
+  });
+});
+
+test('daily capacity subtracts enabled lunch once without excluding lunch from meetings or planned time', () => {
+  const day = '2026-09-07';
+  const settings = { ...T.DEFAULT_SETTINGS, lunchEnabled: true };
+  const events = [{ start: `${day}T12:00:00`, end: `${day}T14:00:00` }];
+  const items = [{ source: 'todoist', plannedDay: day, plannedDuration: 120 }];
+  const occurrences = T.routineOccurrences([routine()], day, '13:00');
+  assert.deepEqual(T.dailyPlannedTime(day, settings, events, items, occurrences), {
+    dayMin: 540, lunchMin: 60, meetingsMin: 120, plannedMin: 180, freeMin: 420,
+    bufferMin: 240, bufferPercent: 240 / 420 * 100, unknownTasks: 0,
+  });
+  assert.equal(T.dailyPlannedTime(day, { ...settings, lunchEnabled: false }, [], [], []).dayMin, 600);
+  assert.equal(T.dailyPlannedTime(day, {}, [], [], []).lunchMin, 0);
+});
+
+test('daily lunch capacity clips to the workday and ignores missing, malformed or reversed bounds', () => {
+  const day = '2026-09-07';
+  const settings = { ...T.DEFAULT_SETTINGS, lunchEnabled: true };
+  const cases = [
+    ['07:00', '08:30', 30], ['17:30', '19:00', 30], ['07:00', '19:00', 600],
+    ['06:00', '07:00', 0], ['19:00', '20:00', 0], ['13:30', '12:30', 0],
+    ['12:30', '12:30', 0], ['', '13:30', 0], ['12:30', undefined, 0],
+    ['invalid', '13:30', 0], ['12:30', '25:00', 0], ['12:60', '13:30', 0],
+    ['-1:00', '13:30', 0], ['12:30', '13:30extra', 0], ['8:00', '9:00', 60],
+  ];
+  for (const [lunchStart, lunchEnd, lunchMin] of cases) {
+    const totals = T.dailyPlannedTime(day, { ...settings, lunchStart, lunchEnd }, [], [], []);
+    assert.equal(totals.lunchMin, lunchMin, `${lunchStart} to ${lunchEnd}`);
+    assert.equal(totals.dayMin, 600 - lunchMin);
+    assert.equal(totals.freeMin, totals.dayMin);
+    assert.equal(totals.bufferMin, totals.dayMin);
+    assert.equal(totals.bufferPercent, totals.dayMin === 0 ? null : 100);
+  }
+  for (const dayEnd of ['08:00', '07:00']) {
+    const totals = T.dailyPlannedTime(day, { ...settings, dayEnd, lunchStart: '06:00', lunchEnd: '19:00' }, [], [], []);
+    assert.equal(totals.lunchMin, 0);
+    assert.equal(totals.dayMin, 0);
+  }
+});
+
+test('daily meeting durations add overlaps rather than merging occupied intervals', () => {
+  const day = '2026-09-07';
+  const events = [
+    { day, start: `${day}T09:00:00`, end: `${day}T11:00:00` },
+    { day, start: `${day}T10:00:00`, end: `${day}T11:00:00` },
+  ];
+  const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []);
+  assert.equal(totals.meetingsMin, 180);
+  assert.equal(totals.freeMin, 420);
+  assert.equal(totals.bufferPercent, 100);
+});
+
+test('daily meetings clip to the configured window, ignore true all-day rows and count timed continuations once', () => {
+  const day = '2026-09-07';
+  const events = [
+    { day, start: `${day}T07:00:00`, end: `${day}T09:00:00` },
+    { day, start: `${day}T17:00:00`, end: `${day}T19:00:00` },
+    { day, start: `${day}T19:00:00`, end: `${day}T20:00:00` },
+    { day, allDay: true, start: null, end: null },
+    { day, allDay: true, start: `${day}T00:00:00`, end: '2026-09-08T00:00:00' },
+    { day, continues: true, allDay: true, start: '2026-09-06T23:00:00', end: `${day}T09:00:00` },
+    { day: '2026-09-06', start: '2026-09-06T23:00:00', end: `${day}T09:00:00` },
+    { day, start: 'invalid', end: `${day}T09:00:00` },
+    { day, start: `${day}T11:00:00`, end: `${day}T10:00:00` },
+  ];
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []).meetingsMin, 180);
+});
+
+test('daily planned time counts only date-assigned Todoist durations and routine blocks, not their steps', () => {
+  const day = '2026-09-07';
+  const task = { source: 'todoist', recurring: false, plannedDay: day, plannedHalf: 'am', plannedDuration: 60 };
+  const items = [task, { ...task, status: 'done' }, { ...task, plannedDuration: null },
+    { ...task, source: 'clickup' }, { ...task, source: 'email' }, { ...task, source: 'manual' },
+    { ...task, plannedDay: '2026-09-08' }, { ...task, plannedDay: null, due: day },
+    { ...task, recurring: true, due: day, plannedStart: '09:00', plannedOccurrenceDue: '2026-09-06' },
+  ];
+  const occurrences = T.routineOccurrences([routine()], day, '13:00');
+  occurrences[0].done = occurrences[0].total;
+  const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], items, occurrences);
+  assert.equal(totals.plannedMin, 240);
+  assert.equal(totals.unknownTasks, 1);
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], [],
+    [{ ...occurrences[0], skipped: true }]).plannedMin, 0);
+});
+
+test('daily planned time counts unscheduled assignments without requiring a half and rejects stale recurrence', () => {
+  const day = '2026-09-07';
+  const task = { source: 'todoist', recurring: false, plannedDay: day, plannedDuration: 60 };
+  const items = [task, { ...task, status: 'done' }, { ...task, plannedDuration: null },
+    { ...task, recurring: true, due: day, plannedOccurrenceDue: day },
+    { ...task, recurring: true, due: day, plannedOccurrenceDue: '2026-09-06' },
+    { ...task, recurring: true, due: day, plannedStart: '09:00' },
+    { ...task, plannedDay: '2026-02-30' }];
+  const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], items, []);
+  assert.equal(totals.plannedMin, 180);
+  assert.equal(totals.unknownTasks, 1);
+});
+
+test('daily planned time retains recorded recurrence durations once without borrowing current estimates', () => {
+  const day = '2026-09-07';
+  const prior = { source: 'todoist', recurring: true, due: day, plannedDay: day,
+    plannedStart: '09:00', plannedDuration: 60, plannedOccurrenceDue: day };
+  const plan = T.syncCompletionPlan({ prior, sourceItem: { due: '2026-09-08' },
+    shadow: { due: day }, recurringAdvance: 'drop' });
+  assert.equal(plan.occurrence.plannedDuration, 60);
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  assert.match(main, /planned_duration: ops\.occurrence\.plannedDuration/);
+  const occurrences = T.normalizeOccurrences([
+    { due: day, planned_day: day, planned_duration: 60 },
+    { due: day, planned_day: day, planned_duration: 60 },
+    { due: '2026-09-06', planned_day: day, planned_half: 'am' },
+  ]);
+  const advanced = { ...prior, due: '2026-09-08', plannedDay: '2026-09-08',
+    plannedDuration: 180, plannedOccurrenceDue: '2026-09-08', occurrences };
+  const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], [advanced], []);
+  assert.equal(totals.plannedMin, 60);
+  assert.equal(totals.unknownTasks, 1);
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], [{ ...prior, occurrences }], []).plannedMin, 60);
+  const stale = T.syncCompletionPlan({ prior: { ...prior, plannedOccurrenceDue: '2026-09-05' },
+    sourceItem: { due: '2026-09-08' }, shadow: { due: day }, recurringAdvance: 'drop' });
+  assert.equal(stale.occurrence.plannedDuration, undefined);
+});
+
+test('daily due-only estimates belong to the due date unless an explicit planned day owns them', () => {
+  const day = '2026-09-07';
+  const task = { source: 'todoist', recurring: false, due: day, plannedDuration: 60 };
+  const items = [task, { ...task, plannedDay: '2026-09-08' },
+    { ...task, recurring: true, plannedOccurrenceDue: '2026-09-06' },
+    { ...task, due: '2026-02-30' }];
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], items, []).plannedMin, 60);
+  const plan = T.syncCompletionPlan({ prior: { ...task, recurring: true },
+    sourceItem: { due: '2026-09-08' }, shadow: { due: day } });
+  assert.equal(plan.occurrence.plannedDay, day);
+  assert.equal(plan.occurrence.plannedDuration, 60);
+});
+
+test('SIMULATED: occurrence writer saves the completed duration before clearing the live timed plan', async () => {
+  const day = '2026-09-07';
+  const fm = { type: 'planner-item', source: 'todoist', external_id: 'recurring',
+    title: 'Recurring', recurring: true, due: day, priority: 3, tags: [],
+    planned_day: day, planned_start: '09:00', planned_duration: 60, planned_occurrence_due: day };
+  const prior = T.itemFromFrontmatter(fm, '02 Planner/Todoist/Recurring.md', 'Recurring');
+  prior.file = {};
+  const sourceItem = { title: 'Recurring', recurring: true, due: '2026-09-08', priority: 3, tags: [] };
+  const plan = T.syncCompletionPlan({ prior, sourceItem, shadow: { due: day }, recurringAdvance: 'drop' });
+  const plugin = {
+    app: { fileManager: { processFrontMatter: async (_file, change) => change(fm) } },
+    markSyncWrite: () => {},
+  };
+  await T.IcorPlannerPlugin.prototype.updateItemFile.call(plugin, prior, sourceItem,
+    { title: sourceItem.title, due: sourceItem.due, priority: 3 }, '', plan);
+  assert.equal(fm.planned_duration, undefined);
+  assert.equal(fm.occurrences[0].planned_duration, 60);
+  const advanced = T.itemFromFrontmatter(fm, prior.path, 'Recurring');
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, [], [advanced], []).plannedMin, 60);
+});
+
+test('daily planned time divides by negative free time and reports N/A only for zero', () => {
+  const day = '2026-09-07';
+  const settings = { ...T.DEFAULT_SETTINGS, dayStart: '09:00', dayEnd: '11:00' };
+  const items = [{ source: 'todoist', recurring: false, plannedDay: day, plannedStart: '09:00', plannedDuration: 120 }];
+  const meeting = { start: `${day}T09:00:00`, end: `${day}T10:00:00` };
+  const overplanned = T.dailyPlannedTime(day, settings, [meeting], items, []);
+  assert.equal(overplanned.bufferMin, -60);
+  assert.equal(overplanned.bufferPercent, -100);
+  const full = { start: `${day}T09:00:00`, end: `${day}T11:00:00` };
+  assert.equal(T.dailyPlannedTime(day, settings, [full], items, []).bufferPercent, null);
+  const negative = T.dailyPlannedTime(day, settings, [full, meeting], items, []);
+  assert.equal(negative.freeMin, -60);
+  assert.equal(negative.bufferMin, -180);
+  assert.equal(negative.bufferPercent, 300);
+  const empty = T.dailyPlannedTime(day, { ...settings, dayEnd: '09:00' }, [], [], []);
+  assert.equal(empty.dayMin, 0);
+  assert.equal(empty.bufferPercent, null);
+  assert.equal(T.dailyPlannedTime(day, { ...settings, dayEnd: '08:00' }, [], [], []).dayMin, 0);
+  assert.equal(T.dailyPlannedTime(day, {}, [], [], []).dayMin, 600);
+});
+
+function dailyCalendarDef(uid, start, end) {
+  return T.parseIcs(['BEGIN:VCALENDAR', 'BEGIN:VEVENT', `UID:${uid}`,
+    `DTSTART:${start}`, `DTEND:${end}`, 'END:VEVENT', 'END:VCALENDAR'].join('\n'));
+}
+
+test('daily calendars use only settings-enabled feeds and deduplicate enabled mirrored events', () => {
+  const visible = dailyCalendarDef('visible', '20260907T090000', '20260907T100000');
+  const hidden = dailyCalendarDef('hidden', '20260907T100000', '20260907T110000');
+  const plugin = {
+    settings: { calendars: [{ id: 'visible', name: 'Visible' }, { id: 'hidden', name: 'Hidden', enabled: false }] },
+    calendarStatus: { perFeed: { visible: { ok: true }, hidden: { ok: false, warning: 'Disabled warning.' } } },
+    calendarDefs: visible,
+    calendarDefsByFeed: { visible },
+    capacityCalendarDefsByFeed: { hidden: [...hidden, ...visible] },
+  };
+  const model = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.equal(model.events.length, 1);
+  assert.deepEqual(model.missing, []);
+  assert.deepEqual(model.cached, []);
+  assert.deepEqual(model.warnings, []);
+  assert.equal(T.dailyPlannedTime('2026-09-07', T.DEFAULT_SETTINGS, model.events, [], []).meetingsMin, 60);
+  plugin.settings.calendars[1].enabled = true;
+  const enabled = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.equal(enabled.events.length, 2);
+  assert.deepEqual(enabled.cached, ['Hidden']);
+  assert.deepEqual(enabled.warnings, ['Hidden: Disabled warning.']);
+  assert.equal(T.dailyPlannedTime('2026-09-07', T.DEFAULT_SETTINGS, enabled.events, [], []).meetingsMin, 120);
+  plugin.settings.calendars.pop();
+  assert.equal(T.dailyCapacityCalendars(plugin, '2026-09-07', 13).events.length, 1);
+});
+
+test('daily calendars expose missing feeds but distinguish a fetched empty calendar', () => {
+  const plugin = {
+    settings: { calendars: [{ id: 'empty', name: 'Empty' }, { id: 'missing', name: 'Missing' },
+      { id: 'disabled', name: 'Disabled', enabled: false }] },
+    calendarDefsByFeed: { empty: [] },
+  };
+  const model = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.deepEqual(model.events, []);
+  assert.deepEqual(model.missing, ['Missing']);
+  assert.deepEqual(model.cached, ['Empty', 'Missing']);
+});
+
+test('daily calendars recognize successful empty and mirrored-only feeds omitted from definitions', () => {
+  const visible = dailyCalendarDef('mirror', '20260907T090000', '20260907T100000');
+  const plugin = {
+    settings: { calendars: [{ id: 'visible', name: 'Visible' }, { id: 'mirror', name: 'Mirror' },
+      { id: 'empty', name: 'Empty' }] },
+    calendarStatus: { perFeed: { visible: { ok: true, count: 1 }, mirror: { ok: true, count: 1 },
+      empty: { ok: true, count: 0 } } },
+    calendarDefsByFeed: { visible },
+  };
+  const model = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.equal(model.events.length, 1);
+  assert.deepEqual(model.missing, []);
+  assert.deepEqual(model.cached, []);
+  assert.equal(T.dailyPlannedTime('2026-09-07', T.DEFAULT_SETTINGS, model.events, [], []).meetingsMin, 60);
+});
+
+test('daily calendars with only disabled feeds produce no totals or data warnings even with stale caches', () => {
+  const plugin = {
+    settings: { calendars: [{ id: 'disabled', name: 'Disabled', enabled: false }] },
+    calendarStale: true,
+    capacityCalendarDefsByFeed: { disabled: dailyCalendarDef('disabled', '20260907T090000', '20260907T100000') },
+    calendarStatus: { perFeed: { disabled: { ok: false, warning: 'Disabled warning.' } } },
+  };
+  assert.deepEqual(T.dailyCapacityCalendars(plugin, '2026-09-07', 13),
+    { events: [], missing: [], cached: [], warnings: [] });
+});
+
+test('daily feed warnings survive another successful feed clearing the global stale flag', () => {
+  const plugin = {
+    settings: { calendars: [{ id: 'healthy', name: 'Healthy' }, { id: 'failed', name: 'Failed' },
+      { id: 'partial', name: 'Partial' }, { id: 'unconfirmed', name: 'Unconfirmed' }] },
+    calendarStale: false,
+    calendarStatus: { perFeed: { healthy: { ok: true }, failed: { ok: false },
+      partial: { ok: true, warning: 'Calendar window incomplete.' } } },
+    calendarDefsByFeed: { healthy: [], failed: [], partial: [], unconfirmed: [] },
+  };
+  const model = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.deepEqual(model.cached, ['Failed', 'Unconfirmed']);
+  assert.deepEqual(model.warnings, ['Partial: Calendar window incomplete.']);
+  plugin.calendarStale = true;
+  assert.deepEqual(T.dailyCapacityCalendars(plugin, '2026-09-07', 13).cached,
+    ['Healthy', 'Failed', 'Partial', 'Unconfirmed']);
+});
+
+test('daily calendars recover Monday carry-in from the previous week without repeating multi-day rows', () => {
+  const defs = dailyCalendarDef('overnight', '20260906T230000', '20260907T090000');
+  const plugin = { settings: { calendars: [{ id: 'calendar' }] }, calendarDefsByFeed: { calendar: defs } };
+  const model = T.dailyCapacityCalendars(plugin, '2026-09-07', 13);
+  assert.equal(model.events.length, 1);
+  assert.equal(T.dailyPlannedTime('2026-09-07', T.DEFAULT_SETTINGS, model.events, [], []).meetingsMin, 60);
+  const long = dailyCalendarDef('long', '20260830T230000', '20260907T090000');
+  plugin.calendarDefsByFeed.calendar = long;
+  assert.equal(T.dailyPlannedTime('2026-09-07', T.DEFAULT_SETTINGS,
+    T.dailyCapacityCalendars(plugin, '2026-09-07', 13).events, [], []).meetingsMin, 60);
+});
+
+test('SIMULATED: daily summary has labels, signed buffer, accessible tooltips and explicit data warnings', () => {
+  const element = (options = {}) => {
+    const node = { className: options.cls || '', text: options.text || '', attributes: options.attr || {}, children: [] };
+    node.createDiv = node.createSpan = (childOptions) => {
+      const child = element(childOptions);
+      node.children.push(child);
+      return child;
+    };
+    node.setAttribute = (name, value) => { node.attributes[name] = value; };
+    node.addClass = (name) => { node.className += ` ${name}`; };
+    return node;
+  };
+  const totals = { dayMin: 540, lunchMin: 60, meetingsMin: 120, plannedMin: 480, freeMin: 420,
+    bufferMin: -60, bufferPercent: -60 / 420 * 100, unknownTasks: 1 };
+  const summary = T.renderDailyPlannedTime(element(), '2026-09-07', totals,
+    { missing: ['Missing'], cached: ['Hidden'] }, true);
+  assert.equal(summary.attributes['aria-label'], 'Daily planned time for 2026-09-07');
+  assert.deepEqual(summary.children.slice(0, 3).map((child) => child.children[0].text), ['Meetings', 'Planned', 'Buffer']);
+  assert.ok(summary.children.slice(0, 3).every((child) => child.attributes.role === 'group'));
+  assert.equal(summary.children[2].children[1].text, '-1h (-14.3%)');
+  assert.equal(summary.children[2].children[2].text, 'Overplanned');
+  assert.match(summary.children[2].title, /Net workday capacity: 9h/);
+  assert.match(summary.children[2].attributes['aria-label'], /minus 1h of enabled, valid configured lunch within the workday/);
+  assert.match(summary.children[2].title, /Meeting durations include any lunch overlap/);
+  assert.match(summary.children[0].title, /Missing calendar data: Missing/);
+  assert.match(summary.children[0].attributes['aria-label'], /Calendars use last-known or unconfirmed data: Hidden/);
+  assert.match(summary.children[3].text, /1 task\/occurrence without duration; Calendar data incomplete/);
+  const zero = T.renderDailyPlannedTime(element(), '2026-09-07',
+    { ...totals, meetingsMin: 540, plannedMin: 60, freeMin: 0, bufferPercent: null },
+    { missing: [], cached: [] }, false);
+  assert.equal(zero.children[2].children[1].text, '-1h (N/A)');
+  assert.match(zero.children[2].title, /free time is zero/);
+  const negative = T.renderDailyPlannedTime(element(), '2026-09-07',
+    { ...totals, meetingsMin: 600, plannedMin: 120, freeMin: -60, bufferMin: -180, bufferPercent: 300 },
+    { missing: [], cached: [], warnings: ['Partial: Calendar window incomplete.'] }, false);
+  assert.equal(negative.children[2].children[1].text, '-3h (300%)');
+  assert.equal(negative.children[2].children[2].text, 'Overplanned');
+  assert.match(negative.children[2].title, /positive ratio does not indicate available time/);
+  assert.match(negative.children[0].title, /Calendar window incomplete/);
+  assert.match(negative.children[3].text, /Calendar feed warnings/);
+  assert.equal(T.dailyDurationText(-90), '-1h 30m');
+  assert.equal(T.dailyDurationText(0), '0m');
+});
+
+test('SOURCE: daily metrics top-align unequal heights and wrap without fixed heights or lost identities', () => {
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  const summary = css.match(/\.iplan-daily-summary\.iplan-card-meta\s*\{([^}]+)\}/)[1];
+  assert.match(summary, /display:\s*grid/);
+  assert.match(summary, /align-items:\s*start/);
+  assert.match(summary, /grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+  assert.doesNotMatch(summary, /(?:^|;)\s*(?:min-|max-)?height\s*:/);
+  for (const kind of ['label', 'value', 'warning']) {
+    const rule = css.match(new RegExp(`\\.iplan-daily-${kind}\\s*\\{([^}]+)\\}`))[1];
+    assert.match(rule, /overflow-wrap:\s*anywhere/);
+    assert.doesNotMatch(rule, /(?:^|;)\s*(?:min-|max-)?height\s*:/);
+  }
+  for (const [kind, color] of [['meetings', 'red'], ['planned', 'yellow'], ['buffer', 'green']]) {
+    assert.ok(css.includes(`.iplan-daily-metric.is-${kind} { border-top: 2px solid var(--color-${color}); }`));
+  }
+  assert.match(css, /\.iplan-daily-metric\.is-overplanned \.iplan-daily-warning\s*\{\s*color:\s*var\(--text-error/);
+});
+
+test('SOURCE: WEEK and DAY share daily totals while the countdown and visibility-controlled display remain separate', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
+  assert.ok(board.includes('const capacityCalendars = dailyCapacityCalendars(this.plugin, eventsWeekStart, splitHour);'));
+  assert.ok(board.includes('const capacityRoutines = routineOccurrences(this.plugin.routines || [], day,'));
+  assert.ok(board.includes('capacityCalendars.events, items, capacityRoutines)'));
+  assert.ok(board.includes('capacityCalendars, capacityCalendars.cached.length > 0)'));
+  assert.ok(board.includes('const routines = this.plugin.routinesFor(day);'));
+  assert.ok(board.includes('const seg = segmentInfo(this.plugin.settings, mins);'));
+  assert.ok(board.includes("colHead.insertAdjacentElement('afterend', cd);"));
+  assert.ok(main.includes('const capacityDefs = adoptCacheDefs(parsed.defs, calendarFeeds(this.settings));'));
+  assert.ok(main.includes('buildCalendarCacheContent(capacityDefs, new Date()'));
+});
+
 test('a routine note parses to steps and a per-day log', () => {
   const r = routine();
   assert.equal(r.name, 'Morning launch');
@@ -307,24 +671,67 @@ test('the routines folder derives from the planner folder and is created with th
 function routineCardFixture() {
   const main = fs.readFileSync(T.__mainPath, 'utf8');
   const renderer = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
-  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('  getViewType()', main.indexOf('class PlannerBoardView extends ItemView')));
-  const setMode = main.slice(main.indexOf('  setMode(mode) {', main.indexOf('class PlannerBoardView extends ItemView')), main.indexOf('  render() {', main.indexOf('class PlannerBoardView extends ItemView')));
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
+  const scale = main.match(/const PLANNER_PIXELS_PER_MINUTE\s*=[^;]+;/)[0];
+  const openedModals = [];
+  const computedStyle = (node) => ({ paddingLeft: '8px', paddingRight: '8px', fontSize: '12px',
+    display: node.style.display || 'block', visibility: node.style.visibility || 'visible',
+    ...node.computedStyle });
   const element = (tagName) => {
-    const node = { tagName, children: [], attributes: {}, listeners: {}, className: '', hidden: false };
+    const node = { tagName, children: [], attributes: {}, listeners: {}, className: '', hidden: false, dataset: {}, style: {}, isConnected: true };
     node.classList = {
-      add: (name) => { if (!node.className.split(' ').includes(name)) node.className += ` ${name}`; },
+      add: (...names) => { for (const name of names) if (!node.className.split(' ').includes(name)) node.className += ` ${name}`; },
       toggle: (name, enabled) => {
         node.className = node.className.split(' ').filter((value) => value !== name).join(' ');
         if (enabled) node.classList.add(name);
       },
     };
     node.setAttribute = (name, value) => { node.attributes[name] = value; };
-    node.appendChild = (child) => { node.children.push(child); return child; };
-    node.insertBefore = (child, before) => { node.children.splice(node.children.indexOf(before), 0, child); };
+    node.getAttribute = (name) => node.attributes[name];
+    node.appendChild = (child) => { child.parentElement = node; node.children.push(child); return child; };
+    node.insertBefore = (child, before) => { child.parentElement = node; node.children.splice(node.children.indexOf(before), 0, child); };
+    node.matches = (selector) => selector === ':disabled' && !!node.disabled;
+    node.getClientRects = () => {
+      for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
+        if (!ancestor.isConnected || ancestor.hidden || computedStyle(ancestor).display === 'none') return [];
+      }
+      return [{}];
+    };
+    node.addClass = (...names) => node.classList.add(...names);
+    node.style.setProperty = (name, value) => { node.style[name] = value; };
+    node.focus = () => { node.focused = true; };
+    node.empty = () => { node.children = []; };
+    node.createEl = (tag, options = {}) => {
+      const child = element(tag);
+      child.className = options.cls || '';
+      child.textContent = options.text || '';
+      child.attributes = { ...(options.attr || {}) };
+      if (options.attr && options.attr.title) child.title = options.attr.title;
+      return node.appendChild(child);
+    };
+    node.createDiv = (options) => node.createEl('div', options);
+    node.createSpan = (options) => node.createEl('span', options);
+    node.querySelector = (selector) => {
+      const classMatch = /^\.([\w-]+)/.exec(selector);
+      const attributeMatch = /\[([\w-]+)="(.*)"\]/.exec(selector);
+      for (const child of node.children) {
+        if ((!classMatch || child.className.split(' ').includes(classMatch[1]))
+          && (!attributeMatch || child.attributes[attributeMatch[1]] === attributeMatch[2])) return child;
+        const nested = child.querySelector(selector);
+        if (nested) return nested;
+      }
+      return null;
+    };
+    node.getBoundingClientRect = () => ({
+      left: node.className.includes('iplan-routine-label-gutter') ? 300 : 0,
+      right: 100, width: 240,
+      height: node.measuredHeight || parseFloat(node.style.height) || 24,
+      ...node.measuredRect,
+    });
     node.addEventListener = (name, listener) => { node.listeners[name] = listener; };
-    node.fire = (name) => {
+    node.fire = (name, values = {}) => {
       const event = {
-        defaultPrevented: false, stopped: false,
+        defaultPrevented: false, stopped: false, target: node, ...values,
         preventDefault() { this.defaultPrevented = true; },
         stopPropagation() { this.stopped = true; },
       };
@@ -333,9 +740,24 @@ function routineCardFixture() {
     };
     return node;
   };
-  return vm.runInNewContext(`${renderer}\n${board}\n${setMode}\n}\n({ renderRoutineCard, PlannerBoardView })`, {
-    Set, ItemView: class {}, document: { createElement: element },
+  return vm.runInNewContext(`${scale}\n${renderer}\n${board}\n({ renderRoutineCard, PlannerBoardView, RoutineDetailModal, element, openedModals, PLANNER_PIXELS_PER_MINUTE })`, {
+    Set, Map, ItemView: class {
+      constructor(leaf) { this.leaf = leaf || {}; this.leaf.view = this; }
+    }, element, openedModals, document: { createElement: element },
+    getComputedStyle: computedStyle,
+    Modal: class {
+      constructor() { this.contentEl = element('div'); }
+      open() { openedModals.push(this); this.onOpen(); }
+      close() { this.onClose(); }
+    },
+    CSS: { escape: (value) => value },
+    markInkPlugin: (node, id) => node.setAttribute('data-ink-plugin', id),
     todayStr: () => '2026-09-07', mondayOf: () => '2026-09-07',
+    timedGridBounds: T.timedGridBounds, timedGridColumns: T.timedGridColumns,
+    activeTimedPlacement: T.activeTimedPlacement, plannedDuration: T.plannedDuration,
+    localDayStr: T.localDayStr, fmtTimeHM: T.fmtTimeHM, hmToMin: T.hmToMin,
+    plannedStartText: (minute) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`,
+    wireTimedDrop: () => {},
     routineCardState: T.routineCardState, routineKicker: T.routineKicker,
     routineTimeLabel: T.routineTimeLabel, checklistModel: T.checklistModel,
     setIcon: (node, icon) => { node.icon = icon; },
@@ -426,37 +848,513 @@ test('SIMULATED: mode changes and step callbacks retain expansion; a card withou
   assert.equal(agenda.hidden, false);
   assert.equal(agenda.children.length, 2);
   assert.equal(agenda.children[0].children[0].tagName, 'span');
-  assert.equal(agenda.checklist.model.rows.length, 3);
+  assert.equal(agenda.querySelector('.iplan-card-sub-toggle'), null);
   assert.equal(view.routineExpanded.size, 0);
 });
 
-test('SIMULATED: calendar (time-scaled) routine blocks carry the same chevron, steps and per-occurrence state', () => {
+test('SIMULATED: every calendar bar and title opens details without calendar chevrons or steps', () => {
+  const { renderRoutineCard, PlannerBoardView, openedModals, element } = routineCardFixture();
+  const plugin = { app: {}, manifest: { id: 'mahdyar-planner' } };
+  const view = new PlannerBoardView(null, plugin);
+  view.contentEl = element('div');
+  view.render = () => {};
+  for (const end of ['09:15', '10:00']) {
+    const occ = T.routineOccurrence(routine({ start: '09:00', end }), '2026-09-07', '13:00');
+    const key = JSON.stringify([occ.routine.path, occ.day]);
+    view.routineExpanded.add(key);
+    const card = renderRoutineCard(plugin, occ, view, true);
+    const title = card.querySelector('.iplan-routine-detail-button');
+    assert.equal(card.querySelector('.iplan-card-sub-toggle'), null);
+    assert.equal(card.querySelector('.iplan-card-sub-chevron'), null);
+    assert.equal(card.children.length, end === '09:15' ? 1 : 2);
+    assert.equal(card.attributes.role, 'button');
+    assert.equal(card.attributes.tabindex, '0');
+    assert.equal(card.attributes['aria-haspopup'], 'dialog');
+    for (const [opener, eventName, values] of [
+      [title, 'click', {}], [card, 'click', {}],
+      [card, 'keydown', { key: 'Enter' }], [card, 'keydown', { key: ' ' }],
+    ]) {
+      const count = openedModals.length;
+      const event = opener.fire(eventName, values);
+      assert.equal(event.defaultPrevented, true);
+      assert.equal(event.stopped, true);
+      assert.equal(openedModals.length, count + 1);
+      assert.equal(openedModals.at(-1).occ, occ);
+      assert.equal(openedModals.at(-1).opener, opener);
+      openedModals.at(-1).close();
+    }
+    const count = openedModals.length;
+    assert.equal(card.fire('keydown', { key: 'Escape' }).defaultPrevented, false);
+    assert.equal(card.fire('keydown', { key: 'Enter', target: title }).defaultPrevented, false);
+    assert.equal(card.fire('click', { defaultPrevented: true }).stopped, false);
+    assert.equal(openedModals.length, count);
+    assert.equal(view.routineExpanded.has(key), true);
+  }
+});
+
+test('SIMULATED: only short timed routines are compact and their full name and time remain accessible', () => {
   const { renderRoutineCard, PlannerBoardView } = routineCardFixture();
   const view = new PlannerBoardView(null, {});
-  const occ = T.routineOccurrence(routine(), '2026-09-07', '13:00');
+  for (const [end, compact] of [['09:15', true], ['09:30', true], ['10:00', false]]) {
+    const occ = T.routineOccurrence(routine({ start: '09:00', end }), '2026-09-07', '13:00');
+    const card = renderRoutineCard({}, occ, view, true);
+    const title = card.querySelector('.iplan-routine-detail-button');
+    assert.equal(card.className.split(' ').includes('is-compact'), compact);
+    if (!compact) {
+      assert.equal(card.children[0].children[0].textContent, T.routineKicker(occ));
+      assert.equal(card.children[0].children[1].textContent, T.routineTimeLabel(occ));
+      assert.equal(card.children[1].tagName, 'button');
+      assert.equal(card.children[1].textContent, occ.routine.name);
+    }
+    assert.equal(title.tagName, 'button');
+    assert.equal(title.type, 'button');
+    assert.equal(title.attributes['aria-haspopup'], 'dialog');
+    assert.equal(title.attributes['aria-label'], `Morning launch, 2026-09-07, 09:00 - ${end}`);
+    assert.equal(title.title, card.title);
+    assert.equal(title.fire('pointerdown').stopped, true);
+    assert.equal(renderRoutineCard({}, occ, view).className.split(' ').includes('is-compact'), false);
+  }
+});
+
+test('SIMULATED: details reopen expanded independently, keep step callbacks and restore title or bar focus', async () => {
+  const { renderRoutineCard, PlannerBoardView, openedModals, element } = routineCardFixture();
+  const calls = [];
+  const plugin = { app: {}, manifest: { id: 'mahdyar-planner' },
+    toggleRoutineStep: (...args) => calls.push(args) };
+  const view = new PlannerBoardView(null, plugin);
+  const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), '2026-09-07', '13:00');
+  view.contentEl = element('div');
+  view.render = () => {
+    view.contentEl.empty();
+    view.contentEl.appendChild(renderRoutineCard(plugin, occ, view, true));
+  };
   const key = JSON.stringify([occ.routine.path, occ.day]);
-  const card = renderRoutineCard({}, occ, view, true);
-  const toggle = card.children[0].children[0];
-  const steps = card.children[1];
-  assert.equal(toggle.tagName, 'button');
-  assert.equal(card.children[0].children[1].tagName, 'div');
-  assert.equal(steps.hidden, true);
-  assert.equal(steps.checklist.model.rows.length, 3);
-  assert.equal(toggle.fire('pointerdown').stopped, true);
-  const event = toggle.fire('click');
-  assert.equal(event.defaultPrevented, true);
-  assert.equal(event.stopped, true);
-  assert.equal(steps.hidden, false);
-  assert.equal(toggle.attributes['aria-expanded'], 'true');
-  assert.ok(card.className.split(' ').includes('is-open'));
-  assert.equal(view.routineExpanded.has(key), true);
-  const rerendered = renderRoutineCard({}, occ, view, true);
-  assert.equal(rerendered.children[1].hidden, false);
-  const otherDay = T.routineOccurrence(routine(), '2026-09-08', '13:00');
-  assert.equal(renderRoutineCard({}, otherDay, view, true).children[1].hidden, true);
-  toggle.fire('click');
-  assert.equal(steps.hidden, true);
+  for (const listOpen of [false, true]) {
+    if (listOpen) view.routineExpanded.add(key);
+    else view.routineExpanded.delete(key);
+    for (const selector of ['.iplan-routine-detail-button', '.iplan-time-routine']) {
+      view.render();
+      for (let opening = 0; opening < 2; opening += 1) {
+        view.contentEl.querySelector(selector).fire('click');
+        const modal = openedModals.at(-1);
+        assert.equal(modal.contentEl.attributes['data-ink-plugin'], 'mahdyar-planner');
+        assert.equal(modal.contentEl.children.length, 3);
+        assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
+        assert.equal(modal.contentEl.children[1].textContent, '2026-09-07, 09:00 - 09:15');
+        const card = modal.contentEl.children[2];
+        const toggle = card.children[0].children[0];
+        const steps = card.children[2];
+        assert.equal(steps.hidden, false);
+        assert.equal(toggle.attributes['aria-expanded'], 'true');
+        assert.equal(toggle.focused, true);
+        await steps.checklist.options.onToggle('1', true);
+        assert.deepEqual(calls.at(-1), [occ.routine.path, occ.day, 1, true, occ.total]);
+        steps.checklist.options.onProgress(3, 3);
+        assert.ok(card.className.split(' ').includes('is-done'));
+        toggle.fire('click');
+        assert.equal(steps.hidden, true);
+        assert.equal(toggle.attributes['aria-expanded'], 'false');
+        assert.equal(view.routineExpanded.has(key), listOpen);
+        assert.equal(renderRoutineCard(plugin, occ, view).children[2].hidden, !listOpen);
+        modal.close();
+        assert.equal(view.contentEl.querySelector(selector).focused, true);
+        assert.equal(view.contentEl.querySelector('.iplan-card-sub-toggle'), null);
+      }
+    }
+  }
+});
+
+test('SIMULATED: Outside is permanent with no prototype state or selector', () => {
+  const { PlannerBoardView } = routineCardFixture();
+  const settings = { ...T.DEFAULT_SETTINGS };
+  const view = new PlannerBoardView(null, { settings });
+  assert.equal(Object.hasOwn(view, 'routineLabelMode'), false);
+  assert.equal(view.setRoutineLabelMode, undefined);
+  assert.equal(view.renderRoutineLabelControl, undefined);
+  assert.equal(Object.hasOwn(view.getState(), 'routineLabelMode'), false);
+  assert.deepEqual(settings, T.DEFAULT_SETTINGS);
+});
+
+test('SIMULATED: permanent Outside keeps exact routine geometry, event slots and daily totals in WEEK and DAY', () => {
+  const fixture = routineCardFixture();
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = fixture;
+  const day = '2026-09-07';
+  const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), day, '13:00');
+  const events = [{ uid: 'meeting', day, half: 'am', start: `${day}T09:00:00`, end: `${day}T09:30:00`, title: 'Meeting' }];
+  const plugin = { settings: T.DEFAULT_SETTINGS, app: {}, manifest: { id: 'mahdyar-planner' } };
+  const totals = T.dailyPlannedTime(day, plugin.settings, events, [], [occ]);
+  let baseline;
+  for (const range of ['week', 'day']) {
+    const view = new PlannerBoardView(null, plugin);
+    view.mode = range;
+    view.wireEvent = () => {};
+    view.renderTimedGrid(day, element('div'), [], events, [occ]);
+    const grid = view.timedGrids.get(day);
+    const geometry = grid.entries.map((entry) => [entry.start, entry.end, entry.duration,
+      entry.element.style.top, entry.element.style.height, entry.element.style.left, entry.element.style.width]);
+    if (!baseline) baseline = geometry;
+    assert.deepEqual(geometry, baseline);
+    const entry = grid.entries.find((candidate) => candidate.kind === 'routine');
+    assert.equal(entry.element.style.height, `${15 * PLANNER_PIXELS_PER_MINUTE}px`);
+    assert.equal(entry.element.style.top, `${(540 - grid.start) * PLANNER_PIXELS_PER_MINUTE}px`);
+    assert.ok(entry.labelElement);
+    assert.equal(entry.labelElement.tagName, 'button');
+    assert.equal(entry.labelElement.attributes.type, 'button');
+    assert.equal(entry.labelElement.attributes['aria-label'], entry.element.title);
+    assert.equal(entry.labelElement.attributes['aria-haspopup'], 'dialog');
+    entry.labelElement.fire('click');
+    assert.equal(fixture.openedModals.at(-1).occ, occ);
+    assert.deepEqual(T.dailyPlannedTime(day, plugin.settings, events, [], [occ]), totals);
+  }
+});
+
+test('SIMULATED: outside labels bound lanes on resize and connect real block edges to clamped labels', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const view = new PlannerBoardView(null, { settings: T.DEFAULT_SETTINGS });
+  const entries = [0, 0, 0, 1439].map((start, index) => ({
+    key: `routine:${index}`, kind: 'routine', start, end: start + 1, duration: 1,
+    element: element('div'), labelElement: element('button'), labelLeader: element('div'),
+  }));
+  for (const [index, entry] of entries.entries()) {
+    entry.element.style.height = `${PLANNER_PIXELS_PER_MINUTE}px`;
+    entry.element.measuredRect = { right: 80 + index * 20 };
+    entry.labelElement.measuredHeight = 44;
+    for (const name of ['line', 'bend', 'line']) entry.labelLeader.createDiv({ cls: `iplan-routine-label-${name}` });
+  }
+  const grid = { start: 0, end: 1440, entries, slots: element('div'), canvas: element('div'),
+    labelGutter: element('div'), labelOverflow: element('button') };
+  grid.labelGutter.measuredRect = { left: 300, width: 240 };
+  view.timedGrids.set(day, grid);
+  for (const [width, hiddenCount] of [[240, 1], [112, 2], [80, 2], [360, 0]]) {
+    grid.labelGutter.measuredRect.width = width;
+    view.onResize();
+    assert.equal(grid.hiddenRoutineEntries.length, hiddenCount);
+    assert.equal(entries[0].labelElement.hidden, false, `${width}px gutter keeps its first name`);
+    assert.equal(entries[3].labelElement.hidden, false, `${width}px gutter keeps a noncolliding name`);
+    assert.equal(grid.labelOverflow.hidden, hiddenCount === 0);
+    assert.match(grid.labelOverflow.attributes['aria-label'], /show full list and details/);
+    for (const entry of entries) {
+      assert.equal(entry.element.style.top, `${entry.start * PLANNER_PIXELS_PER_MINUTE}px`);
+      assert.equal(entry.element.style.height, `${PLANNER_PIXELS_PER_MINUTE}px`);
+      assert.equal(entry.labelLeader.hidden, entry.labelElement.hidden);
+      if (entry.labelElement.hidden) continue;
+      const labelTop = parseFloat(entry.labelElement.style.top);
+      assert.ok(labelTop >= 0);
+      assert.ok(labelTop + 44 <= 1440 * PLANNER_PIXELS_PER_MINUTE);
+      assert.ok(parseFloat(entry.labelElement.style.width) >= Math.min(width, 112));
+      assert.ok(parseFloat(entry.labelElement.style.left) + parseFloat(entry.labelElement.style.width) <= width);
+      const anchor = (entry.start + 0.5) * PLANNER_PIXELS_PER_MINUTE;
+      assert.equal(entry.labelLeader.style.top, `${anchor}px`);
+      assert.equal(parseFloat(entry.labelLeader.style.left), entry.element.measuredRect.right);
+      const [line, vertical, tail] = entry.labelLeader.children;
+      const offset = labelTop + 22 - anchor;
+      assert.equal(parseFloat(vertical.style.height), Math.abs(offset));
+      assert.equal(parseFloat(vertical.style.top), Math.min(0, offset));
+      assert.equal(parseFloat(tail.style.top) + anchor, labelTop + 22);
+      assert.equal(parseFloat(entry.labelLeader.style.left) + parseFloat(tail.style.left) + parseFloat(tail.style.width),
+        300 + parseFloat(entry.labelElement.style.left));
+      assert.equal(line.style.width, vertical.style.left);
+    }
+    const visible = entries.filter((entry) => !entry.labelElement.hidden);
+    for (const [index, first] of visible.entries()) {
+      for (const second of visible.slice(index + 1)) {
+        assert.ok(first.labelElement.style.left !== second.labelElement.style.left
+          || Math.abs(parseFloat(first.labelElement.style.top) - parseFloat(second.labelElement.style.top)) >= 44);
+      }
+    }
+  }
+});
+
+test('SIMULATED: normal WEEK widths keep a first external name lane and overflow only collisions', () => {
+  const { PlannerBoardView, element, openedModals, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = { settings: T.DEFAULT_SETTINGS, app: {}, manifest: { id: 'mahdyar-planner' } };
+  const view = new PlannerBoardView(null, plugin);
+  view.mode = 'week';
+  const occurrences = [540, 540, 660].map((start, index) => T.routineOccurrence(
+    routine({ name: `Ordinary routine with a long name ${index}`,
+      start: `${String(Math.floor(start / 60)).padStart(2, '0')}:00`,
+      end: `${String(Math.floor(start / 60)).padStart(2, '0')}:15` }, null, `Routine ${index}.md`), day, '13:00'));
+  view.renderTimedGrid(day, element('div'), [], [], occurrences);
+  const grid = view.timedGrids.get(day);
+  const geometry = grid.entries.map((entry) => ({ ...entry.element.style }));
+  for (const canvasWidth of [150, 190, 220]) {
+    const gutterWidth = canvasWidth * 0.42;
+    grid.canvas.measuredRect = { left: 0, width: canvasWidth };
+    grid.labelGutter.measuredRect = { left: canvasWidth - gutterWidth, width: gutterWidth };
+    for (const entry of grid.entries) entry.element.measuredRect = { right: canvasWidth - gutterWidth - 4 };
+    view.relayoutTimedGrid(day);
+    assert.equal(grid.hiddenRoutineEntries.length, 1, `${canvasWidth}px WEEK canvas`);
+    assert.equal(grid.labelOverflow.textContent, '1 more routine');
+    assert.equal(grid.labelOverflow.hidden, false);
+    for (const index of [0, 2]) {
+      const entry = grid.entries[index];
+      assert.equal(entry.labelElement.hidden, false);
+      assert.equal(entry.labelLeader.hidden, false);
+      assert.equal(entry.labelElement.textContent, occurrences[index].routine.name);
+      assert.equal(entry.labelElement.attributes['aria-label'], entry.element.title);
+      assert.equal(parseFloat(entry.labelElement.style.width), gutterWidth);
+      const [, , tail] = entry.labelLeader.children;
+      assert.equal(parseFloat(entry.labelLeader.style.left) + parseFloat(tail.style.left) + parseFloat(tail.style.width),
+        grid.labelGutter.measuredRect.left);
+      assert.equal(entry.element.style.top, `${entry.start * PLANNER_PIXELS_PER_MINUTE}px`);
+    }
+    assert.equal(grid.entries[1].labelElement.hidden, true);
+    assert.deepEqual(grid.entries.map((entry) => ({ ...entry.element.style })), geometry);
+  }
+  grid.entries[0].labelElement.fire('click');
+  assert.equal(openedModals.at(-1).occ, occurrences[0]);
+  grid.entries = [grid.entries[0]];
+  view.relayoutTimedGrid(day);
+  assert.equal(grid.entries[0].labelElement.hidden, false);
+  assert.equal(grid.labelOverflow.hidden, true);
+  assert.equal(grid.hiddenRoutineEntries.length, 0);
+});
+
+test('SIMULATED: unusably narrow gutters fall back inline without overflow or geometry changes and recover on resize', () => {
+  const { PlannerBoardView, element, openedModals } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = { settings: T.DEFAULT_SETTINGS, app: {}, manifest: { id: 'mahdyar-planner' } };
+  const view = new PlannerBoardView(null, plugin);
+  const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), day, '13:00');
+  view.renderTimedGrid(day, element('div'), [], [], [occ]);
+  const grid = view.timedGrids.get(day);
+  const entry = grid.entries[0];
+  const geometry = { ...entry.element.style };
+  for (const width of [16, 0, 80]) {
+    grid.labelGutter.measuredRect = { left: 100, width };
+    view.relayoutTimedGrid(day);
+    const fallback = width < 40;
+    assert.equal(entry.element.className.split(' ').includes('is-inline-label-fallback'), fallback);
+    assert.equal(entry.element.className.split(' ').includes('has-outside-label'), !fallback);
+    assert.equal(entry.labelElement.hidden, fallback);
+    assert.equal(entry.labelLeader.hidden, fallback);
+    assert.equal(grid.hiddenRoutineEntries.length, 0);
+    assert.equal(grid.labelOverflow.hidden, true);
+    assert.deepEqual({ ...entry.element.style }, geometry);
+    if (fallback) {
+      const detail = entry.element.querySelector('.iplan-routine-detail-button');
+      assert.equal(detail.attributes['aria-label'], entry.element.title);
+      detail.fire('click');
+      assert.equal(openedModals.at(-1).occ, occ);
+    }
+  }
+});
+
+test('SIMULATED: detail focus follows Outside-to-inline fallback and restoration in WEEK and DAY', () => {
+  for (const mode of ['week', 'day']) {
+    const { PlannerBoardView, renderRoutineCard, element, openedModals } = routineCardFixture();
+    const day = '2026-09-07';
+    const plugin = { settings: T.DEFAULT_SETTINGS, app: {}, manifest: { id: 'mahdyar-planner' } };
+    const view = new PlannerBoardView(null, plugin);
+    view.mode = mode;
+    view.contentEl = element('div');
+    const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), day, '13:00');
+    const otherDay = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), '2026-09-08', '13:00');
+    let width = 80;
+    let entry;
+    let inline;
+    let decoy;
+    let renders = 0;
+    view.render = () => {
+      renders += 1;
+      view.contentEl.empty();
+      decoy = renderRoutineCard(plugin, otherDay, view, true);
+      view.contentEl.appendChild(decoy);
+      view.renderTimedGrid(day, view.contentEl, [], [], [occ]);
+      const grid = view.timedGrids.get(day);
+      grid.labelGutter.measuredRect = { left: 100, width };
+      view.relayoutTimedGrid(day);
+      entry = grid.entries[0];
+      inline = entry.element.querySelector('.iplan-routine-detail-button');
+      inline.computedStyle = { display: width < 40 ? 'block' : 'none' };
+    };
+    view.render();
+    entry.labelElement.fire('click');
+    const outsideModal = openedModals.at(-1);
+    width = 16;
+    view.timedGrids.get(day).labelGutter.measuredRect.width = width;
+    view.onResize();
+    assert.equal(entry.labelElement.hidden, true);
+    outsideModal.close();
+    assert.equal(renders, 2);
+    assert.equal(inline.focused, true);
+    assert.equal(entry.labelElement.focused, undefined);
+    assert.equal(decoy.focused, undefined);
+    assert.equal(decoy.querySelector('.iplan-routine-detail-button').focused, undefined);
+    inline.fire('click');
+    const inlineModal = openedModals.at(-1);
+    width = 80;
+    view.timedGrids.get(day).labelGutter.measuredRect.width = width;
+    view.onResize();
+    inlineModal.close();
+    assert.equal(renders, 3);
+    assert.equal(inline.hidden, false);
+    assert.equal(inline.getClientRects().length, 0);
+    assert.equal(inline.focused, undefined);
+    assert.equal(entry.labelElement.hidden, false);
+    assert.equal(entry.labelElement.focused, true);
+    assert.equal(entry.element.focused, undefined);
+  }
+});
+
+test('SIMULATED: detail focus rejects CSS-hidden, inaccessible and disabled openers and ancestors', () => {
+  for (const state of ['css-display', 'css-visibility', 'css-ancestor', 'hidden-ancestor',
+    'inert-ancestor', 'aria-hidden-ancestor', 'aria-disabled', 'disabled', 'bar-only', 'none']) {
+    const { PlannerBoardView, renderRoutineCard, RoutineDetailModal, element } = routineCardFixture();
+    const plugin = { app: {}, manifest: { id: 'mahdyar-planner' } };
+    const view = new PlannerBoardView(null, plugin);
+    view.contentEl = element('div');
+    const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), '2026-09-07', '13:00');
+    const opener = element('button');
+    opener.className = 'iplan-routine-outside-label';
+    let outside;
+    let inline;
+    let bar;
+    view.render = () => {
+      view.contentEl.empty();
+      const gutter = view.contentEl.createDiv();
+      outside = gutter.createEl('button', { cls: 'iplan-routine-outside-label',
+        attr: { 'data-routine-detail': JSON.stringify([occ.routine.path, occ.day]) } });
+      bar = view.contentEl.appendChild(renderRoutineCard(plugin, occ, view, true));
+      inline = bar.querySelector('.iplan-routine-detail-button');
+      if (state === 'css-visibility') outside.computedStyle = { visibility: 'hidden' };
+      else if (state === 'css-ancestor') gutter.computedStyle = { display: 'none' };
+      else if (state === 'hidden-ancestor') gutter.hidden = true;
+      else if (state === 'inert-ancestor') gutter.inert = true;
+      else if (state === 'aria-hidden-ancestor') gutter.setAttribute('aria-hidden', 'true');
+      else if (state === 'aria-disabled') outside.setAttribute('aria-disabled', 'true');
+      else if (state === 'disabled') outside.disabled = true;
+      else outside.computedStyle = { display: 'none' };
+      if (state === 'bar-only') inline.disabled = true;
+      if (state === 'none') bar.setAttribute('aria-hidden', 'true');
+    };
+    const modal = new RoutineDetailModal(plugin, occ, view, opener);
+    modal.open();
+    modal.close();
+    assert.equal(outside.hidden, false, state);
+    assert.equal(outside.focused, undefined, state);
+    assert.equal(inline.focused, state === 'bar-only' || state === 'none' ? undefined : true, state);
+    assert.equal(bar.focused, state === 'bar-only' ? true : undefined, state);
+  }
+});
+
+test('SIMULATED: overflow opens every hidden routine with details and restores overflow focus', () => {
+  const { PlannerBoardView, element, openedModals } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = { settings: T.DEFAULT_SETTINGS, app: {}, manifest: { id: 'mahdyar-planner' } };
+  const view = new PlannerBoardView(null, plugin);
+  const occurrences = Array.from({ length: 5 }, (_, index) => T.routineOccurrence(
+    routine({ name: `Routine ${index}`, start: '09:00', end: '09:15' }, null, `Routine ${index}.md`), day, '13:00'));
+  view.contentEl = element('div');
+  view.render = () => {
+    view.contentEl.empty();
+    view.renderTimedGrid(day, view.contentEl, [], [], occurrences);
+  };
+  view.render();
+  const grid = view.timedGrids.get(day);
+  assert.equal(grid.hiddenRoutineEntries.length, 3);
+  assert.equal(grid.labelOverflow.textContent, '3 more routines');
+  grid.labelOverflow.fire('click');
+  const modal = openedModals.at(-1);
+  assert.deepEqual(Array.from(modal.occurrences), Array.from(grid.hiddenRoutineEntries, (entry) => entry.occ));
+  assert.match(modal.contentEl.children[0].textContent, /More routines on 2026-09-07/);
+  for (const [index, occurrence] of modal.occurrences.entries()) {
+    const card = modal.contentEl.children[2 + index * 2];
+    assert.equal(card.children[1].textContent, occurrence.routine.name);
+    assert.equal(card.children[2].checklist.model.rows.length, 3);
+    assert.equal(card.children[2].hidden, false);
+    assert.equal(card.children[0].children[0].attributes['aria-expanded'], 'true');
+    card.children[0].children[0].fire('click');
+    assert.equal(card.children[2].hidden, true);
+  }
   assert.equal(view.routineExpanded.size, 0);
+  assert.equal(modal.contentEl.children.length, 1 + 2 * modal.occurrences.length);
+  assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
+  modal.close();
+  assert.equal(view.contentEl.querySelector('.iplan-routine-label-overflow').focused, true);
+  view.contentEl.querySelector('.iplan-routine-label-overflow').fire('click');
+  const reopened = openedModals.at(-1);
+  for (const index of reopened.occurrences.keys()) {
+    assert.equal(reopened.contentEl.children[2 + index * 2].children[2].hidden, false);
+  }
+  reopened.close();
+});
+
+test('SIMULATED: detail close never renders or focuses a closed, detached or replaced originating view', async () => {
+  for (const state of ['closed', 'detached', 'replaced']) {
+    const { PlannerBoardView, RoutineDetailModal, element } = routineCardFixture();
+    const plugin = { app: {}, manifest: { id: 'mahdyar-planner' } };
+    const view = new PlannerBoardView(null, plugin);
+    const occ = T.routineOccurrence(routine(), '2026-09-07', '13:00');
+    const opener = element('button');
+    view.contentEl = element('div');
+    let renders = 0;
+    view.render = () => { renders += 1; };
+    const modal = new RoutineDetailModal(plugin, occ, view, opener);
+    modal.open();
+    assert.equal(view.routineDetailModal, modal);
+    if (state === 'closed') {
+      await view.onClose();
+      assert.equal(view.routineDetailModal, null);
+      assert.equal(modal.contentEl.children.length, 0);
+    }
+    if (state === 'detached') view.contentEl.isConnected = false;
+    if (state === 'replaced') view.leaf.view = {};
+    modal.close();
+    assert.equal(renders, 0, state);
+    assert.equal(opener.focused, undefined, state);
+    assert.equal(view.routineDetailModal, null, state);
+    assert.equal(modal.contentEl.children.length, 0, state);
+    if (state === 'closed') {
+      const grid = { entries: [] };
+      view.timedGrids.set('closed', grid);
+      view.onResize();
+      assert.equal(grid.hiddenRoutineEntries, undefined);
+    }
+  }
+});
+
+test('SIMULATED: long routine headers, time and skipped status stay inline with permanent Outside short labels', () => {
+  const { PlannerBoardView, element } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = { settings: T.DEFAULT_SETTINGS };
+  const long = { ...T.routineOccurrence(routine({ start: '09:00', end: '10:00' }), day, '13:00'), skipped: true };
+  const short = T.routineOccurrence(routine({ start: '11:00', end: '11:30' }), day, '13:00');
+  for (const range of ['week', 'day']) {
+    const view = new PlannerBoardView(null, plugin);
+    view.mode = range;
+    view.renderTimedGrid(day, element('div'), [], [], [long, short]);
+    const entry = view.timedGrids.get(day).entries[0];
+    assert.equal(entry.labelElement, undefined);
+    assert.equal(entry.element.children[0].children[0].textContent, T.routineKicker(long));
+    assert.equal(entry.element.children[0].children[1].textContent, '09:00 - 10:00');
+    assert.equal(entry.element.children[0].children[2].textContent, 'SKIPPED');
+    assert.equal(entry.element.children[1].textContent, long.routine.name);
+    assert.equal(entry.element.children[1].tagName, 'button');
+    assert.equal(entry.element.querySelector('.iplan-card-sub-toggle'), null);
+    assert.ok(view.timedGrids.get(day).entries[1].labelElement);
+  }
+});
+
+test('SOURCE: compact and outside styling preserve duration and keep labels out of event space', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  assert.doesNotMatch(main, /routineLabelMode|renderRoutineLabelControl|setRoutineLabelMode|Routine label prototype/);
+  assert.doesNotMatch(css, /iplan-routine-label-control/);
+  assert.doesNotMatch(main.slice(main.indexOf('class RoutineDetailModal'), main.indexOf('function showRoutineMenu(')), /Close routine details|setIcon\(close, 'x'\)/);
+  assert.match(css, /\.iplan-root \.iplan-time-routine\.is-compact\s*\{\s*padding: 0 2px;\s*gap: 0;/);
+  assert.match(css, /\.iplan-root \.iplan-time-routine:focus-visible,/);
+  assert.match(css, /\.has-outside-routine-labels \.iplan-time-slots\s*\{ right: var\(--iplan-routine-gutter\); \}/);
+  assert.match(css, /\.iplan-routine-label-gutter\s*\{[^}]*overflow: hidden/);
+  assert.match(css, /\.iplan-root button\.iplan-routine-outside-label\s*\{[^}]*text-overflow: ellipsis/);
+  assert.match(css, /\.iplan-root button\.iplan-routine-outside-label\s*\{[^}]*box-sizing: border-box;[^}]*min-width: 0/);
+  assert.match(css, /\.iplan-routine-label-leader\s*\{[^}]*pointer-events: none/);
+  assert.match(css, /\.iplan-routine-label-line,[\s\S]*?\.iplan-routine-label-bend\s*\{[^}]*pointer-events: none/);
+  assert.match(css, /\.iplan-routine-label-overflow\[hidden\]\s*\{ display: none !important/);
+  const blockRules = [...css.matchAll(/[^{}]*\.iplan-time-routine[^{}]*\{([^}]+)\}/g)];
+  for (const rule of blockRules) assert.doesNotMatch(rule[1], /min-height:\s*(?!0)[\d.]+(?:px|em|rem)/);
 });
 test('SOURCE: the AGENDA tray view owns routineExpanded and passes itself to the routine card', () => {
   const main = fs.readFileSync(T.__mainPath, 'utf8');

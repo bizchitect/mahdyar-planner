@@ -232,8 +232,6 @@ button.iplan-sync-btn.is-syncing svg {
   padding: 5px 7px 8px;
   overflow: hidden;
 }
-/* Open steps may outgrow the fixed block height; scroll inside it. */
-.iplan-time-routine.is-open { overflow-y: auto; }
 .iplan-time-routine .iplan-routine-kicker { min-width: 0; }
 .iplan-time-routine .iplan-card-title { min-width: 0; }
 .iplan-time-event {
@@ -318,6 +316,28 @@ button.iplan-sync-btn.is-syncing svg {
   font-size: 9px;
   color: var(--iplan-marker);
 }
+
+.iplan-daily-summary.iplan-card-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  gap: 0.5em;
+  margin: 0;
+  min-width: 0;
+  font-family: var(--iplan-mono);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.iplan-daily-metric { display: flex; flex-direction: column; min-width: 0; }
+.iplan-daily-label { color: var(--iplan-dim); overflow-wrap: anywhere; }
+.iplan-daily-value { color: var(--iplan-paper); overflow-wrap: anywhere; }
+.iplan-daily-metric.is-meetings { border-top: 2px solid var(--color-red); }
+.iplan-daily-metric.is-planned { border-top: 2px solid var(--color-yellow); }
+.iplan-daily-metric.is-buffer { border-top: 2px solid var(--color-green); }
+.iplan-daily-warning { color: var(--iplan-dim); overflow-wrap: anywhere; }
+.iplan-daily-metric.is-overplanned .iplan-daily-value,
+.iplan-daily-metric.is-overplanned .iplan-daily-warning { color: var(--text-error, var(--color-red)); }
+.iplan-daily-summary > .iplan-daily-warning { grid-column: 1 / -1; }
 
 /* all-day band */
 .iplan-allday { display: flex; flex-direction: column; gap: 4px; }
@@ -1383,6 +1403,125 @@ ul.iplan-settings-list li { margin: 3px 0; }
 /* ----------------------------------------------- coarse pointer (b) ---- */
 @media (any-pointer: coarse) {
   .iplan-root button.iplan-card-sub-toggle, .iplan-tray-root button.iplan-card-sub-toggle { min-height: 44px; }
+}
+
+.iplan-root .iplan-time-routine.is-compact .iplan-routine-kicker {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  flex-wrap: nowrap;
+  min-width: 0;
+  gap: 2px;
+}
+.iplan-root button.iplan-routine-detail-button {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  flex: 1 1 0;
+  min-width: 0;
+  font-family: var(--iplan-display);
+  font-size: var(--font-smallest);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--iplan-paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.iplan-root .iplan-time-routine.is-compact {
+  padding: 0 2px;
+  gap: 0;
+}
+.iplan-root .iplan-time-routine.is-compact .iplan-routine-kicker {
+  margin: 0;
+  line-height: 1;
+}
+.iplan-root .iplan-time-routine { cursor: pointer; }
+.iplan-root .iplan-time-routine:focus-visible,
+.iplan-root button.iplan-routine-detail-button:focus-visible {
+  outline: 1px solid var(--iplan-marker);
+  outline-offset: -1px;
+}
+.iplan-root.iplan-routine-detail { padding: 0; }
+.iplan-routine-detail .iplan-card-title {
+  display: block;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+.iplan-time-canvas.has-outside-routine-labels {
+  --iplan-routine-gutter: min(42%, 12em);
+}
+.has-outside-routine-labels .iplan-time-slots { right: var(--iplan-routine-gutter); }
+.iplan-routine-label-gutter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: var(--iplan-routine-gutter);
+  overflow: hidden;
+  border-left: 1px solid var(--iplan-hairline);
+  box-sizing: border-box;
+}
+.iplan-root button.iplan-routine-outside-label {
+  all: unset;
+  position: absolute;
+  box-sizing: border-box;
+  height: var(--size-4-6, 24px);
+  padding: 0 var(--size-4-2, 8px);
+  min-width: 0;
+  display: block;
+  cursor: pointer;
+  font-family: var(--iplan-display);
+  font-size: var(--font-smallest);
+  font-weight: 600;
+  line-height: var(--size-4-6, 24px);
+  letter-spacing: 0;
+  color: var(--iplan-paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 1;
+}
+.iplan-routine-label-leader {
+  position: absolute;
+  pointer-events: none;
+}
+.iplan-routine-label-line,
+.iplan-routine-label-bend {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 1px;
+  background: var(--iplan-hairline);
+  pointer-events: none;
+}
+.iplan-routine-label-bend { width: 1px; }
+.iplan-root button.iplan-routine-label-overflow {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: var(--font-smallest);
+}
+.iplan-routine-outside-label[hidden],
+.iplan-routine-label-leader[hidden],
+.iplan-routine-label-overflow[hidden] { display: none !important; }
+.iplan-root button.iplan-routine-outside-label:focus-visible,
+.iplan-root button.iplan-routine-label-overflow:focus-visible {
+  outline: 1px solid var(--iplan-marker);
+  outline-offset: -1px;
+}
+.iplan-root .has-outside-label button.iplan-routine-detail-button { display: none; }
+@media (any-pointer: coarse) {
+  .iplan-root button.iplan-routine-outside-label {
+    height: 44px;
+    line-height: 44px;
+  }
 }
 
 /* ----------------------------------------------------------- habits ---- */
