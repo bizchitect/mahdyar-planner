@@ -395,7 +395,7 @@ body.iplan-dragging .iplan-lane-empty { visibility: hidden; }
   width: 100%;
   height: 0;
   z-index: 6;
-  border-top: 1px dashed color-mix(in srgb, var(--iplan-marker) 55%, transparent);
+  border-top: 2px dashed color-mix(in srgb, var(--iplan-marker) 55%, transparent);
   pointer-events: none;
 }
 .iplan-day[data-rail-state='before'] .iplan-now-rail,
