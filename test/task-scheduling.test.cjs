@@ -2,8 +2,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const T = require('./harness.cjs');
 const mainSource = fs.readFileSync(T.__mainPath, 'utf8');
+const stylesSource = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
 
 test('startup sync and debounced refresh cannot run after unload', () => {
   assert.match(mainSource, /async onload\(\) \{\s*this\._unloaded = false;\s*this\._startupSyncTimer = null;\s*this\._emitTimer = null;/);
@@ -186,6 +188,8 @@ test('the unscheduled source tray excludes all planned tasks', () => {
 
 test('Overview and Calendar are independent persisted layout choices', () => {
   assert.match(mainSource, /this\.layout = 'overview'/);
+  assert.match(mainSource, /el\.dataset\.layout = this\.layout;/);
+  assert.match(stylesSource, /\.iplan-root\[data-layout='overview'\]\s+\.iplan-now-rail\s*\{\s*display:\s*none;\s*\}/);
   assert.match(mainSource, /layout: this\.layout/);
   assert.match(mainSource, /state\.layout === 'overview' \|\| state\.layout === 'calendar'/);
   assert.match(mainSource, /mkSeg\(seg, 'WEEK', 'week', this\.mode/);

@@ -10263,6 +10263,7 @@ class PlannerBoardView extends ItemView {
 
   render() {
     const el = this.contentEl;
+    el.dataset.layout = this.layout;
     el.empty();
     this.timedGrids.clear();
     this._todayCol = null;

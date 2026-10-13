@@ -398,6 +398,7 @@ body.iplan-dragging .iplan-lane-empty { visibility: hidden; }
   border-top: 2px dashed color-mix(in srgb, var(--iplan-marker) 55%, transparent);
   pointer-events: none;
 }
+.iplan-root[data-layout='overview'] .iplan-now-rail { display: none; }
 .iplan-day[data-rail-state='before'] .iplan-now-rail,
 .iplan-day[data-rail-state='after'] .iplan-now-rail { display: none; }
 
