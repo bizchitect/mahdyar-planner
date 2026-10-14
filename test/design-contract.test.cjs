@@ -21,6 +21,64 @@ const root = process.env.PLANNER_ROOT
 const main = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'styles.css'), 'utf8');
 
+test('workday boundaries stay neutral and the now rail stays dashed with asymmetric paint-only overhang', () => {
+  const selectors = [
+    '.iplan-workday-label',
+    '.iplan-root button.iplan-workday-label',
+    '.iplan-workday-label::after',
+    '.iplan-workday-line',
+    '.iplan-now-rail',
+    '.iplan-now-rail::before',
+    '.iplan-root button.iplan-workday-title',
+    '.iplan-root button.iplan-workday-title::before',
+    '.iplan-root button.iplan-workday-title::after',
+    '.iplan-root button.iplan-workday-title:focus-visible',
+  ];
+  const rules = selectors.map((selector) => {
+    const start = css.indexOf(`${selector} {`);
+    assert.ok(start >= 0, `${selector} must exist`);
+    const end = css.indexOf('}', start);
+    assert.ok(end > start, `${selector} must have a complete rule`);
+    return css.slice(start, end);
+  });
+  for (const rule of rules.slice(0, 2)) {
+    assert.match(rule, /color: var\(--iplan-dim\);/);
+    assert.doesNotMatch(rule, /--color-blue/);
+  }
+  for (const rule of rules.slice(2, 4)) {
+    assert.match(rule, /border-top: 2px solid var\(--iplan-dim\);/);
+    assert.doesNotMatch(rule, /--color-blue/);
+  }
+  assert.match(rules[4], /border-top: 2px dashed var\(--iplan-marker\);/);
+  assert.match(rules[4], /position: absolute;/);
+  assert.match(rules[4], /left: 0;/);
+  assert.match(rules[4], /top: var\(--iplan-now-top, calc\(var\(--iplan-now-pct, 0\) \* 100%\)\);/);
+  assert.match(rules[4], /width: 100%;/);
+  assert.match(rules[4], /height: 0;/);
+  assert.match(rules[4], /z-index: 6;/);
+  assert.match(rules[4], /border-image-source: repeating-linear-gradient\(\s*to right,\s*var\(--iplan-marker\) 0 var\(--size-4-2\),\s*transparent var\(--size-4-2\) var\(--size-4-3\)\s*\);/);
+  assert.match(rules[4], /border-image-slice: 1 0 0;/);
+  assert.match(rules[4], /border-image-width: 2px 0 0;/);
+  assert.match(rules[4], /border-image-outset: 0 calc\(1\.5 \* var\(--size-4-3\)\) 0 calc\(var\(--size-4-3\) \/ 2\);/);
+  assert.match(rules[4], /border-image-repeat: stretch;/);
+  assert.match(rules[4], /pointer-events: none;/);
+  assert.doesNotMatch(rules[4], /box-shadow|color-mix/);
+  assert.match(rules[5], /left: calc\(var\(--size-4-3\) \/ -2\);/);
+  assert.match(rules[5], /top: -1px;/);
+  assert.match(rules[5], /transform: translateY\(-50%\);/);
+  assert.match(rules[5], /width: var\(--size-4-2\);/);
+  assert.match(rules[5], /height: var\(--size-4-3\);/);
+  assert.match(rules[5], /background: var\(--iplan-marker\);/);
+  assert.match(rules[5], /clip-path: polygon\(0 0, 100% 50%, 0 100%\);/);
+  assert.match(css, /\.iplan-root\[data-layout='overview'\] \.iplan-now-rail \{ display: none; \}/);
+  assert.match(css, /\.iplan-day\[data-rail-state='before'\] \.iplan-now-rail,\s*\.iplan-day\[data-rail-state='after'\] \.iplan-now-rail \{ display: none; \}/);
+  assert.match(rules[6], /color: var\(--iplan-dim\);/);
+  assert.match(rules[7], /border-top: 2px solid var\(--iplan-dim\);/);
+  assert.match(rules[8], /border-left: 1px solid var\(--iplan-dim\);/);
+  assert.match(rules[9], /outline: 2px solid var\(--iplan-marker\);/);
+  for (const rule of rules.slice(6)) assert.doesNotMatch(rule, /--color-blue/);
+});
+
 test('every plugin surface declares data-ink-plugin (the theme contract)', () => {
   // Without it the theme's control rules sit at (0,5,1) and beat every
   // (0,2,0) rule in styles.css. The tray's underline field would render as a
