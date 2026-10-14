@@ -386,16 +386,96 @@ test('daily lunch capacity clips to the workday and ignores missing, malformed o
   }
 });
 
-test('daily meeting durations add overlaps rather than merging occupied intervals', () => {
+test('daily meeting durations merge overlapping occupied intervals', () => {
   const day = '2026-09-07';
   const events = [
     { day, start: `${day}T09:00:00`, end: `${day}T11:00:00` },
     { day, start: `${day}T10:00:00`, end: `${day}T11:00:00` },
   ];
   const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []);
-  assert.equal(totals.meetingsMin, 180);
-  assert.equal(totals.freeMin, 420);
+  assert.equal(totals.meetingsMin, 120);
+  assert.equal(totals.freeMin, 480);
   assert.equal(totals.bufferPercent, 100);
+});
+
+test('daily capacity screenshot counts overlapping workshops once and keeps four hours planned', () => {
+  const day = '2026-10-14';
+  const settings = { ...T.DEFAULT_SETTINGS, dayStart: '08:00', dayEnd: '20:00',
+    lunchEnabled: true, lunchStart: '12:30', lunchEnd: '13:00' };
+  const events = [
+    { day, start: `${day}T11:00:00`, end: `${day}T12:00:00` },
+    { day, start: `${day}T14:00:00`, end: `${day}T14:50:00` },
+    { day, start: `${day}T15:00:00`, end: `${day}T16:00:00` },
+    { day, start: `${day}T17:00:00`, end: `${day}T20:00:00` },
+    { day, start: `${day}T17:00:00`, end: `${day}T20:00:00` },
+  ];
+  const items = [{ source: 'todoist', plannedDay: day, plannedDuration: 180 }];
+  const occurrences = T.routineOccurrences([routine()], day, '13:00');
+  const totals = T.dailyPlannedTime(day, settings, events, items, occurrences);
+  assert.deepEqual(totals, {
+    dayMin: 690, lunchMin: 30, meetingsMin: 350, plannedMin: 240, freeMin: 340,
+    bufferMin: 100, bufferPercent: 100 / 340 * 100, unknownTasks: 0,
+  });
+  assert.equal(T.dailyDurationText(totals.meetingsMin), '5h 50m');
+  assert.equal(T.dailyDurationText(totals.plannedMin), '4h');
+  assert.equal(T.dailyDurationText(totals.bufferMin), '1h 40m');
+  assert.equal(Math.round(totals.bufferPercent * 10) / 10, 29.4);
+});
+
+test('daily meeting union handles unsorted duplicates, nesting, chains, touching intervals and gaps', () => {
+  const day = '2026-09-07';
+  const cases = [
+    { spans: [['09:00', '11:00'], ['09:00', '11:00']], minutes: 120 },
+    { spans: [['10:00', '11:00'], ['09:00', '12:00'], ['10:30', '11:30']], minutes: 180 },
+    { spans: [['11:00', '13:00'], ['09:00', '11:00'], ['10:00', '12:00']], minutes: 240 },
+    { spans: [['10:00', '11:00'], ['09:00', '10:00']], minutes: 120 },
+    { spans: [['13:00', '14:00'], ['09:00', '10:00']], minutes: 120 },
+    { spans: [], minutes: 0 },
+  ];
+  for (const { spans, minutes } of cases) {
+    const events = spans.map(([start, end]) => ({ day, start: `${day}T${start}:00`, end: `${day}T${end}:00` }));
+    const before = JSON.stringify(events);
+    const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []);
+    assert.equal(totals.meetingsMin, minutes, JSON.stringify(spans));
+    assert.equal(totals.freeMin, 600 - minutes);
+    assert.equal(JSON.stringify(events), before);
+  }
+});
+
+test('daily meeting union clips cross-date spans and rejects empty, invalid and out-of-window intervals', () => {
+  const day = '2026-09-07';
+  const events = [
+    { start: '2026-09-06T23:00:00', end: `${day}T09:00:00` },
+    { start: `${day}T07:00:00`, end: `${day}T08:30:00` },
+    { start: `${day}T17:00:00`, end: '2026-09-08T01:00:00' },
+    { start: `${day}T17:30:00`, end: `${day}T19:00:00` },
+    { start: `${day}T07:00:00`, end: `${day}T08:00:00` },
+    { start: `${day}T18:00:00`, end: `${day}T19:00:00` },
+    { start: `${day}T10:00:00`, end: `${day}T10:00:00` },
+    { start: `${day}T11:00:00`, end: `${day}T10:00:00` },
+    { start: 'invalid', end: `${day}T10:00:00` },
+    { start: `${day}T10:00:00`, end: 'invalid' },
+    { start: null, end: `${day}T10:00:00` },
+    { start: `${day}T10:00:00`, end: null },
+  ];
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []).meetingsMin, 120);
+  for (const dayEnd of ['08:00', '07:00']) {
+    assert.equal(T.dailyPlannedTime(day, { ...T.DEFAULT_SETTINGS, dayEnd }, events, [], []).meetingsMin, 0);
+  }
+  const fullDay = [{ start: '2026-09-06T23:00:00', end: '2026-09-08T01:00:00' }];
+  const totals = T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, fullDay, [], []);
+  assert.equal(totals.meetingsMin, 600);
+  assert.equal(totals.freeMin, 0);
+  assert.equal(totals.bufferPercent, null);
+});
+
+test('SOURCE: daily meetings tooltip describes occupied intervals without changing lunch accounting', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const summary = main.slice(main.indexOf('function renderDailyPlannedTime('), main.indexOf('function clampPriorityRank('));
+  assert.match(summary, /overlapping intervals counted once/);
+  assert.doesNotMatch(summary, /overlaps counted separately/);
+  assert.match(summary, /Meeting durations include any lunch overlap/);
+  assert.match(summary, /dailyDurationText\(totals\.meetingsMin\)/);
 });
 
 test('daily meetings clip to the configured window, ignore true all-day rows and count timed continuations once', () => {
@@ -411,7 +491,7 @@ test('daily meetings clip to the configured window, ignore true all-day rows and
     { day, start: 'invalid', end: `${day}T09:00:00` },
     { day, start: `${day}T11:00:00`, end: `${day}T10:00:00` },
   ];
-  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []).meetingsMin, 180);
+  assert.equal(T.dailyPlannedTime(day, T.DEFAULT_SETTINGS, events, [], []).meetingsMin, 120);
 });
 
 test('daily planned time counts only date-assigned Todoist durations and routine blocks, not their steps', () => {

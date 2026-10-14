@@ -1738,15 +1738,23 @@ function dailyPlannedTime(day, settings, events, items, routines) {
   const windowEnd = new Date(windowStart);
   windowStart.setMinutes(start);
   windowEnd.setMinutes(end);
-  let meetingsMin = 0;
+  const meetingIntervals = [];
   for (const event of events || []) {
     if ((event.day && event.day !== day) || (event.allDay && !event.continues)
       || !event.start || !event.end) continue;
     const eventStart = new Date(event.start).getTime();
     const eventEnd = new Date(event.end).getTime();
     if (!Number.isFinite(eventStart) || !Number.isFinite(eventEnd)) continue;
-    meetingsMin += Math.max(0, Math.min(eventEnd, windowEnd.getTime())
-      - Math.max(eventStart, windowStart.getTime())) / 60000;
+    const clippedStart = Math.max(eventStart, windowStart.getTime());
+    const clippedEnd = Math.min(eventEnd, windowEnd.getTime());
+    if (clippedEnd > clippedStart) meetingIntervals.push({ start: clippedStart, end: clippedEnd });
+  }
+  meetingIntervals.sort((left, right) => left.start - right.start);
+  let meetingsMin = 0;
+  let occupiedEnd = windowStart.getTime();
+  for (const interval of meetingIntervals) {
+    meetingsMin += Math.max(0, interval.end - Math.max(interval.start, occupiedEnd)) / 60000;
+    occupiedEnd = Math.max(occupiedEnd, interval.end);
   }
   let plannedMin = 0;
   let unknownTasks = 0;
@@ -1835,7 +1843,7 @@ function renderDailyPlannedTime(parent, day, totals, calendars, stale) {
     return element;
   };
   const calendarDetail = [
-    'Timed calendar durations within the configured day; overlaps counted separately. All-day events excluded.',
+    'Timed calendar durations within the configured day; overlapping intervals counted once. All-day events excluded.',
     calendars.missing.length ? `Missing calendar data: ${calendars.missing.join(', ')}.` : '',
     calendars.cached.length ? `Calendars use last-known or unconfirmed data: ${calendars.cached.join(', ')}.` : '',
     ...(calendars.warnings || []),
