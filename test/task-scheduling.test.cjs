@@ -186,6 +186,17 @@ test('the unscheduled source tray excludes all planned tasks', () => {
   assert.match(mainSource, /\.filter\(\(i\) => i\.source === key && !activeTimedPlacement\(i\) && !i\.plannedDay && !isDone\(i\) && !i\.weeklyGoal\)/);
 });
 
+test('Todoist tray shows tasks labeled this-week or due within the current ISO week', () => {
+  const visible = (task) => T.todoistVisibleInTray(task, '2026-09-16');
+  assert.equal(visible({ source: 'todoist', tags: ['this-week'], due: '2026-09-01' }), true);
+  assert.equal(visible({ source: 'todoist', tags: [], due: '2026-09-14' }), true, 'Monday starts the week');
+  assert.equal(visible({ source: 'todoist', tags: [], due: '2026-09-20' }), true, 'Sunday ends the week');
+  assert.equal(visible({ source: 'todoist', tags: [], due: '2026-09-13' }), false);
+  assert.equal(visible({ source: 'todoist', tags: ['other'], due: '2026-09-21' }), false);
+  assert.equal(visible({ source: 'manual', tags: [], due: null }), true);
+  assert.match(mainSource, /const items = collectItems\(this\.plugin\.app, this\.plugin\.paths\(\)\.root\)\s*\.filter\(\(item\) => todoistVisibleInTray\(item, today\)\);/);
+});
+
 test('Overview and Calendar are independent persisted layout choices', () => {
   assert.match(mainSource, /this\.layout = 'overview'/);
   assert.match(mainSource, /el\.dataset\.layout = this\.layout;/);

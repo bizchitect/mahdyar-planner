@@ -11772,6 +11772,12 @@ function isUntimedHalfDayItem(item, day) {
     && !activeTimedPlacement(item);
 }
 
+function todoistVisibleInTray(item, today) {
+  if (!item || item.source !== 'todoist') return true;
+  return (Array.isArray(item.tags) && item.tags.includes('this-week'))
+    || dayInWeek(item.due, mondayOf(today));
+}
+
 function agendaSections(items, events, today, routineOccs, splitTime) {
   const allDay = [];
   const evHalf = { am: [], pm: [] };
@@ -11905,7 +11911,8 @@ class PlannerTrayView extends ItemView {
     } catch { /* no document in a headless context */ }
     el.empty();
     const today = todayStr();
-    const items = collectItems(this.plugin.app, this.plugin.paths().root);
+    const items = collectItems(this.plugin.app, this.plugin.paths().root)
+      .filter((item) => todoistVisibleInTray(item, today));
     this.index = buildItemIndex(items);
 
     const head = el.createDiv({ cls: 'iplan-tray-head' });
@@ -13537,6 +13544,7 @@ module.exports.__test = {
   trayDefaultTab, trayVisibleTabs, trayTabLabel, trayEffectiveTab,
   trayEmptyState, trayConnectionState, TRAY_COPY, fmtOpenItems,
   trayRevealDecision, trayRevealSpendsTurn,
+  todoistVisibleInTray,
   sourceConfigured, isSyncedSource, canPushToSource, canCompleteOnSource,
   SYNCED_SOURCES, TASK_SOURCES, MANUAL_SOURCE, FETCHED_SOURCES, CONNECTORS,
   manualExternalId, manualItemFrontmatter, reconcileStaleIds, scopeAgrees, clickupScopeKey, EMAIL_MAX_ITEMS,
