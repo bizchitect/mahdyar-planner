@@ -209,6 +209,65 @@ button.iplan-sync-btn.is-syncing svg {
   border-top: 1px solid var(--iplan-hairline);
 }
 .iplan-time-slots.is-drop-target { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--iplan-marker) 45%, transparent); }
+.iplan-workday-label {
+  width: 38px;
+  transform: none;
+  color: var(--color-blue);
+  background: var(--iplan-surface);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0;
+  text-align: left;
+  overflow-wrap: normal;
+}
+.iplan-workday-label > span { display: block; }
+.iplan-root button.iplan-workday-label {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  min-height: 0;
+  margin: 0;
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  pointer-events: auto;
+  touch-action: none;
+  cursor: ns-resize;
+  font-family: var(--iplan-mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--color-blue);
+  background: var(--iplan-surface);
+  text-align: left;
+  white-space: nowrap;
+}
+.iplan-root button.iplan-workday-label:focus-visible {
+  outline: 2px solid var(--iplan-marker);
+  outline-offset: 0;
+}
+.iplan-time-label[hidden] { display: none !important; }
+.iplan-workday-label::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: var(--iplan-workday-anchor);
+  width: var(--size-4-1);
+  border-top: 2px solid var(--color-blue);
+}
+.iplan-workday-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 2px solid var(--color-blue);
+  box-shadow: 0 1px 0 var(--iplan-surface);
+  z-index: 4;
+  pointer-events: none;
+}
 .iplan-time-entry {
   position: absolute;
   box-sizing: border-box;
@@ -232,8 +291,49 @@ button.iplan-sync-btn.is-syncing svg {
   padding: 5px 7px 8px;
   overflow: hidden;
 }
+.iplan-root .iplan-card.iplan-time-routine {
+  box-sizing: border-box;
+  border-left: 2px solid var(--color-green, var(--iplan-success));
+}
 .iplan-time-routine .iplan-routine-kicker { min-width: 0; }
 .iplan-time-routine .iplan-card-title { min-width: 0; }
+.iplan-root .iplan-time-routine {
+  touch-action: none;
+  cursor: grab;
+}
+.iplan-time-routine > .iplan-routine-kicker,
+.iplan-time-routine > .iplan-routine-detail-button { margin-right: var(--size-4-6); }
+.iplan-root button.iplan-plan-move {
+  all: unset;
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--size-4-6);
+  height: min(100%, var(--size-4-6));
+  box-sizing: border-box;
+  cursor: ns-resize;
+  touch-action: none;
+  color: var(--iplan-paper);
+}
+.iplan-plan-move svg { width: var(--size-4-4); height: 100%; max-height: var(--size-4-4); }
+.iplan-root button.iplan-plan-move:hover { background: var(--iplan-wash); }
+.iplan-root button.iplan-plan-move:focus-visible {
+  outline: 2px solid var(--iplan-marker);
+  outline-offset: -2px;
+}
+.iplan-planned-time-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2);
+  margin-block: var(--size-4-2);
+}
+.iplan-planned-time-controls input { min-width: 0; max-width: 100%; }
+.iplan-planned-time-controls button:disabled { color: var(--iplan-faint); cursor: wait; }
 .iplan-time-event {
   align-items: flex-start;
   gap: 4px;
@@ -301,6 +401,7 @@ button.iplan-sync-btn.is-syncing svg {
 
 .iplan-day-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 7px;
   font-size: 11px;
@@ -1535,7 +1636,8 @@ ul.iplan-settings-list li { margin: 3px 0; }
   overflow-wrap: anywhere;
 }
 .iplan-time-canvas.has-outside-routine-labels {
-  --iplan-routine-gutter: min(42%, 12em);
+  --iplan-routine-gutter: max(calc(var(--font-smallest) * 9 + var(--size-4-2) * 2), min(42%, 12em));
+  min-width: calc(42px + var(--size-4-6) * 3 + var(--font-smallest) * 9 + var(--size-4-2) * 2);
 }
 .has-outside-routine-labels .iplan-time-slots { right: var(--iplan-routine-gutter); }
 .iplan-routine-label-gutter {
@@ -1547,6 +1649,49 @@ ul.iplan-settings-list li { margin: 3px 0; }
   overflow: hidden;
   border-left: 1px solid var(--iplan-hairline);
   box-sizing: border-box;
+}
+.iplan-root button.iplan-workday-title {
+  all: unset;
+  position: absolute;
+  display: flex;
+  align-items: center;
+  left: 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0 var(--size-4-2);
+  height: var(--size-4-6);
+  line-height: var(--size-4-6);
+  font-family: var(--iplan-mono);
+  font-size: var(--font-smallest);
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  color: var(--color-blue);
+  cursor: ns-resize;
+  touch-action: none;
+  pointer-events: auto;
+}
+.iplan-root button.iplan-workday-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: var(--iplan-workday-anchor);
+  width: var(--size-4-1);
+  border-top: 2px solid var(--color-blue);
+  pointer-events: none;
+}
+.iplan-root button.iplan-workday-title::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: var(--iplan-workday-leader-top);
+  height: var(--iplan-workday-leader-height);
+  border-left: 1px solid var(--color-blue);
+  pointer-events: none;
+}
+.iplan-root button.iplan-workday-title:focus-visible {
+  outline: 2px solid var(--color-blue);
+  outline-offset: -2px;
 }
 .iplan-root button.iplan-routine-outside-label {
   all: unset;

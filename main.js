@@ -1679,14 +1679,17 @@ function linkifyInto(el, text) {
 
 // Which board segment is `minsNow` in, and how far along (cockpit countdown).
 // Segments derive from dayStart / lunch (or split) / dayEnd. null outside.
-function segmentInfo(settings, minsNow) {
-  const dayStart = hmToMin(settings.dayStart, 480);
-  const dayEnd = hmToMin(settings.dayEnd, 1080);
+function segmentInfo(settings, minsNow, day = todayStr()) {
+  const { start: dayStart, end: dayEnd } = workdayFor(day, settings);
   const lunchOn = !!settings.lunchEnabled;
   const amEnd = lunchOn ? hmToMin(settings.lunchStart, 750) : hmToMin(settings.splitTime, 780);
   const pmStart = lunchOn ? hmToMin(settings.lunchEnd, 810) : amEnd;
-  const seg = (name, a, b) => (minsNow >= a && minsNow < b && b > a)
-    ? { name, pct: (minsNow - a) / (b - a), leftMin: b - minsNow } : null;
+  const seg = (name, from, to) => {
+    const start = Math.max(dayStart, from);
+    const end = Math.min(dayEnd, to);
+    return minsNow >= start && minsNow < end && end > start
+      ? { name, pct: (minsNow - start) / (end - start), leftMin: end - minsNow } : null;
+  };
   return seg('MORNING', dayStart, amEnd) || (lunchOn && seg('LUNCH', amEnd, pmStart)) ||
     seg('AFTERNOON', pmStart, dayEnd) || null;
 }
@@ -1721,8 +1724,7 @@ function fmtLeft(mins) {
 }
 
 function dailyPlannedTime(day, settings, events, items, routines) {
-  const start = hmToMin(settings.dayStart, 480);
-  const end = hmToMin(settings.dayEnd, 1080);
+  const { start, end } = workdayFor(day, settings);
   let lunchMin = 0;
   const lunchClock = /^([01]?\d|2[0-3]):[0-5]\d$/;
   if (settings.lunchEnabled && lunchClock.test(settings.lunchStart)
@@ -5839,6 +5841,55 @@ function normalizeHM(raw) {
 
 function fmtMin(min) { return `${pad2(Math.floor(min / 60))}:${pad2(min % 60)}`; }
 
+function planMinute(raw) {
+  if (Number.isInteger(raw) && raw >= 0 && raw <= 1440) return raw;
+  if (typeof raw !== 'string') return null;
+  if (raw === '24:00') return 1440;
+  const time = normalizeHM(raw);
+  return time ? hmToMin(time, 0) : null;
+}
+
+function planDayValid(day) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+  const [year, month, date] = day.split('-').map(Number);
+  const local = new Date(year, month - 1, date, 12);
+  return local.getFullYear() === year && local.getMonth() === month - 1 && local.getDate() === date;
+}
+
+function normalizeDailyPlanOverrides(raw) {
+  const result = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return result;
+  for (const [day, value] of Object.entries(raw)) {
+    if (!planDayValid(day) || !value || typeof value !== 'object') continue;
+    const entry = {};
+    const workday = {};
+    for (const edge of ['start', 'end']) {
+      const minute = planMinute(value.workday && value.workday[edge]);
+      if (minute !== null) workday[edge] = minute;
+    }
+    if (Object.keys(workday).length && !(workday.start != null && workday.end != null && workday.end <= workday.start)) entry.workday = workday;
+    const routines = {};
+    for (const [path, times] of Object.entries(value.routines && typeof value.routines === 'object' ? value.routines : {})) {
+      if (!path.endsWith('.md') || ['__proto__', 'constructor', 'prototype'].includes(path) || !times) continue;
+      const start = planMinute(times.start);
+      const end = planMinute(times.end);
+      if (start !== null && end !== null && end > start) routines[path] = { start, end };
+    }
+    if (Object.keys(routines).length) entry.routines = routines;
+    if (Object.keys(entry).length) result[day] = entry;
+  }
+  return result;
+}
+
+function workdayFor(day, settings) {
+  const source = settings || {};
+  const start = planMinute(source.dayStart) ?? 480;
+  const end = planMinute(source.dayEnd) ?? 1080;
+  const override = normalizeDailyPlanOverrides(source._dailyPlanOverrides)[day]?.workday || {};
+  const resolved = { start: override.start ?? start, end: override.end ?? end };
+  return resolved.end > resolved.start ? resolved : { start, end };
+}
+
 // The per-type default times: the stored map merged over the built-in one
 // field by field, so a data.json that names one type or one field keeps the
 // rest, and a malformed time falls back instead of breaking the settings tab.
@@ -5931,10 +5982,11 @@ function routineHalf(start, splitTime) {
   return s < split ? 'am' : 'pm';
 }
 
-function routineOccurrence(routine, day, splitTime, defaults) {
+function routineOccurrence(routine, day, splitTime, defaults, overrides) {
   const d = (defaults && defaults[routine.routineType]) || DEFAULT_SETTINGS.routineDefaults[routine.routineType];
-  const startMin = hmToMin(routine.start, hmToMin(d.start, 0));
-  const endMin = hmToMin(routine.end, hmToMin(d.end, startMin));
+  const times = normalizeDailyPlanOverrides(overrides)[day]?.routines?.[routine.path];
+  const startMin = times ? times.start : hmToMin(routine.start, hmToMin(d.start, 0));
+  const endMin = times ? times.end : hmToMin(routine.end, hmToMin(d.end, startMin));
   const state = routineRowState(logRowFor(routine.log, day), routine.steps.length);
   const steps = routine.steps.map((s) => ({ index: s.index, label: s.label, done: state.done.includes(s.index) }));
   return {
@@ -5946,11 +5998,11 @@ function routineOccurrence(routine, day, splitTime, defaults) {
 // The instances for one day: every active routine whose weekdays include
 // the day, in start order. A skipped day is an instance that renders as a
 // ghost; a day with no row is an instance with nothing checked yet.
-function routineOccurrences(routines, day, splitTime, defaults) {
+function routineOccurrences(routines, day, splitTime, defaults, overrides) {
   const code = dayCode(day);
   return (routines || [])
     .filter((r) => r && r.active && Array.isArray(r.weekdays) && r.weekdays.includes(code))
-    .map((r) => routineOccurrence(r, day, splitTime, defaults))
+    .map((r) => routineOccurrence(r, day, splitTime, defaults, overrides))
     .sort((a, b) => (a.startMin - b.startMin) || a.routine.name.localeCompare(b.routine.name));
 }
 
@@ -7126,6 +7178,7 @@ class IcorPlannerPlugin extends Plugin {
     this.secrets = this.vaultFor(backend);
     const adopted = adoptSettings(loaded, this.secrets);
     this.settings = adopted.settings;
+    this.settings._dailyPlanOverrides = normalizeDailyPlanOverrides(this.settings._dailyPlanOverrides);
     this.settings.secretsBackend = backend;
     this.settings.envFilePath = envPath;
     if (adopted.changed || loaded.secretsBackend !== backend || loaded.envFilePath !== envPath) await this.persistSettings();
@@ -7254,7 +7307,20 @@ class IcorPlannerPlugin extends Plugin {
     this.registerEvent(this.app.vault.on('delete', notify));
     this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
       if (watched(file) || this.paths().isInside(oldPath)) {
-        Promise.all([settle(file.path), settle(oldPath)]).then(() => this.emitModelChanged());
+        const newPath = file.path;
+        this.updateDailyPlan((plans) => {
+          let changed = false;
+          for (const entry of Object.values(plans)) {
+            for (const path of Object.keys(entry.routines || {})) {
+              if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+              const next = newPath + path.slice(oldPath.length);
+              entry.routines[next] = entry.routines[path];
+              delete entry.routines[path];
+              changed = true;
+            }
+          }
+          return changed;
+        }).then(() => Promise.all([settle(newPath), settle(oldPath)])).then(() => this.emitModelChanged());
       }
     }));
   }
@@ -7274,10 +7340,84 @@ class IcorPlannerPlugin extends Plugin {
   // env-file mode the move waits for the file: a field is blanked only
   // once its line is on disk, and a value whose write failed is saved back
   // into data.json rather than lost (Vex P-1, 2026-09-08).
-  async persistSettings() {
-    await migrateSecretsSettled(this.settings, this.secrets);
-    await this.saveData(this.settings);
-    await this.secrets.settle();
+  persistSettings(transaction) {
+    const save = async (overrides) => {
+      await migrateSecretsSettled(this.settings, this.secrets);
+      await this.secrets.settle();
+      await this.saveData(JSON.parse(JSON.stringify({ ...this.settings, ...overrides })));
+    };
+    const pending = (this._settingsSaveQueue || Promise.resolve()).then(() =>
+      transaction ? transaction(save) : save());
+    this._settingsSaveQueue = pending.catch(() => {});
+    return pending;
+  }
+
+  updateDailyPlan(change) {
+    return this.persistSettings(async (save) => {
+      const before = normalizeDailyPlanOverrides(this.settings._dailyPlanOverrides);
+      const next = normalizeDailyPlanOverrides(before);
+      if (change(next) === false) return false;
+      const normalized = normalizeDailyPlanOverrides(next);
+      try {
+        await save({ _dailyPlanOverrides: normalized });
+        this.settings._dailyPlanOverrides = normalized;
+        this.emitModelChanged();
+        return true;
+      } catch {
+        let restored = true;
+        try {
+          await save({ _dailyPlanOverrides: before });
+        } catch {
+          restored = false;
+        }
+        this.emitModelChanged();
+        new Notice(restored
+          ? 'Planner: planned time could not be saved. The previous plan was restored.'
+          : 'Planner: planned time could not be saved or restored on disk. The previous plan remains in memory; reload may differ.');
+        return false;
+      }
+    });
+  }
+
+  setDailyPlannedTime(day, path, times) {
+    if (!planDayValid(day)) return Promise.resolve(false);
+    return this.updateDailyPlan((plans) => {
+      let current;
+      if (path) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        current = this.routinesFor(day).find((occurrence) => occurrence.routine.path === path);
+        if (!this.paths().isRoutine(path) || !(file instanceof TFile) || file.path !== path || !current) {
+          new Notice('Planner: this routine changed or no longer exists. Reopen its current details.');
+          this.emitModelChanged();
+          return false;
+        }
+      }
+      const entry = plans[day] || (plans[day] = {});
+      if (path) {
+        const routines = entry.routines || (entry.routines = {});
+        if (times == null) delete routines[path];
+        else {
+          const start = planMinute(times.start);
+          const end = times.end === undefined && start !== null
+            ? start + current.endMin - current.startMin : planMinute(times.end);
+          if (start === null || end === null || end <= start) return false;
+          if (end > 1440) {
+            new Notice('Planner: planned time must fit within this date.');
+            return false;
+          }
+          routines[path] = { start, end };
+        }
+      } else if (times == null) delete entry.workday;
+      else {
+        if (Object.entries(times).some(([edge, value]) => !['start', 'end'].includes(edge) || planMinute(value) === null)) return false;
+        const workday = { ...(entry.workday || {}), ...times };
+        const resolved = workdayFor(day, { ...this.settings, _dailyPlanOverrides: {} });
+        const start = planMinute(workday.start) ?? resolved.start;
+        const end = planMinute(workday.end) ?? resolved.end;
+        if (end <= start) return false;
+        entry.workday = workday;
+      }
+    });
   }
 
   /* ---- the secrets backend (0.12.0) ---- */
@@ -8777,7 +8917,7 @@ class IcorPlannerPlugin extends Plugin {
   // The day's routine instances for the board and the agenda.
   routinesFor(day) {
     if (this.settings.routinesEnabled === false) return [];
-    return routineOccurrences(this.routines || [], day, this.splitHM(), routineDefaultsOf(this.settings));
+    return routineOccurrences(this.routines || [], day, this.splitHM(), routineDefaultsOf(this.settings), this.settings._dailyPlanOverrides);
   }
 
   // Every log write goes through vault.process: the transform runs on the
@@ -9744,6 +9884,27 @@ class RoutineDetailModal extends Modal {
       contentEl.createDiv({ cls: 'iplan-event-modal-row-value', text: `${occurrence.day}, ${routineTimeLabel(occurrence)}` });
       contentEl.appendChild(renderRoutineCard(this.plugin, occurrence, this.view, false, this.routineExpanded,
         !overflow && this.occurrences.length === 1));
+      const controls = contentEl.createDiv({ cls: 'iplan-planned-time-controls' });
+      const input = controls.createEl('input', { attr: { type: 'time', 'aria-label': `Planned start for ${occurrence.routine.name} on ${occurrence.day}` } });
+      input.value = fmtMin(occurrence.startMin);
+      const save = controls.createEl('button', { cls: 'iplan-nav-btn', attr: { type: 'button', title: 'Set planned start', 'aria-label': 'Set planned start' } });
+      setIcon(save, 'clock');
+      const reset = controls.createEl('button', { cls: 'iplan-nav-btn', attr: { type: 'button', title: 'Reset planned time', 'aria-label': 'Reset planned time' } });
+      setIcon(reset, 'rotate-ccw');
+      const change = async (times) => {
+        save.disabled = reset.disabled = true;
+        if (await this.plugin.setDailyPlannedTime(occurrence.day, occurrence.routine.path, times)) this.close();
+        else save.disabled = reset.disabled = false;
+      };
+      save.addEventListener('click', () => {
+        const start = planMinute(input.value);
+        if (start === null) {
+          new Notice('Planner: planned time must fit within this date.');
+          return;
+        }
+        change({ start });
+      });
+      reset.addEventListener('click', () => change(null));
     }
     contentEl.querySelector('.iplan-card-sub-toggle').focus();
   }
@@ -9776,7 +9937,7 @@ class RoutineDetailModal extends Modal {
         ...['.iplan-routine-outside-label', '.iplan-routine-detail-button', '.iplan-time-routine']
           .map((fallback) => this.view.contentEl.querySelector(`${fallback}[data-routine-detail="${occurrenceKey}"]`))];
       const again = candidates.find(canFocus);
-      if (again) again.focus();
+      if (again) again.focus({ preventScroll: true });
     } else if (!this.view && canFocus(this.opener)) this.opener.focus();
   }
 }
@@ -9795,6 +9956,8 @@ function showRoutineMenu(plugin, occ, view, pos) {
   }
   menu.addItem((mi) => mi.setTitle('Reset today').setIcon('eraser')
     .onClick(() => plugin.resetRoutineDay(path, occ.day)));
+  menu.addItem((mi) => mi.setTitle('Reset planned time').setIcon('rotate-ccw')
+    .onClick(() => plugin.setDailyPlannedTime(occ.day, path, null)));
   menu.addItem((mi) => mi.setTitle('Open routine note').setIcon('file-text').onClick(() => {
     const file = plugin.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) plugin.app.workspace.getLeaf('tab').openFile(file);
@@ -9853,9 +10016,9 @@ function showPlanMenu(plugin, item, view, pos) {
   const today = todayStr();
   const days = weekDays(weekStart)
     .filter((d, i) => plugin.settings.showWeekend || i < 5);
-  const start = plannedStartText(snapPlannerMinute(hmToMin(plugin.settings.dayStart, 480)));
   const menu = new Menu();
   days.forEach((day, i) => {
+    const start = plannedStartText(snapPlannerMinute(workdayFor(day, plugin.settings).start));
     const label = `${DAY_NAMES[i]} ${fmtDayNum(day)}${day === today ? ' (today)' : ''}`;
     menu.addItem((mi) => mi
       .setTitle(`${label} · ${start}`)
@@ -9944,6 +10107,122 @@ function wireTimedDrop(slots, grid, onDrop) {
     clear();
     if (path) onDrop(path, start);
   });
+}
+
+function snapDailyPlanMinute(minute, minimum, maximum, fallback) {
+  const lower = Math.ceil(minimum / 15) * 15;
+  const upper = Math.floor(maximum / 15) * 15;
+  return lower <= upper ? Math.max(lower, Math.min(upper, Math.round(minute / 15) * 15)) : fallback;
+}
+
+function wireDailyPlanMove(element, handle, view, options) {
+  const handles = [handle, ...(options.additionalHandles || [])];
+  let activeHandle = handle;
+  let value = options.value;
+  let settledValue = options.value;
+  let revision = 0;
+  let suppressClick = false;
+  const paint = (next, preview = true) => {
+    value = next;
+    if (preview) options.preview(next);
+    for (const control of handles) {
+      control.setAttribute('aria-valuenow', String(next));
+      control.setAttribute('aria-valuetext', fmtMin(next));
+      control.title = `${options.label}: ${fmtMin(next)}`;
+    }
+  };
+  for (const control of handles) {
+    control.setAttribute('role', 'slider');
+    control.setAttribute('aria-orientation', 'vertical');
+    control.setAttribute('aria-label', options.label);
+    control.setAttribute('aria-valuemin', String(options.minimum));
+    control.setAttribute('aria-valuemax', String(options.maximum));
+  }
+  const commit = async (next) => {
+    const currentRevision = ++revision;
+    view.pendingPlanFocus = activeHandle.getAttribute('data-plan-focus');
+    const saved = await options.save(next);
+    if (saved) settledValue = next;
+    else if (revision === currentRevision && element.isConnected) paint(settledValue);
+    if (saved) new Notice(`${options.label}: ${fmtMin(next)}`);
+  };
+  paint(value, false);
+  element.addEventListener('click', (event) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  for (const control of handles) control.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); });
+  const begin = (event) => {
+    const onHandle = handles.some((control) => control.contains(event.target));
+    if (event.button !== 0 || (!onHandle && event.target.closest('button, a, input, label'))) return;
+    activeHandle = handles.find((control) => control.contains(event.target)) || handle;
+    if (view.cancelDailyMove) view.cancelDailyMove();
+    suppressClick = false;
+    event.stopPropagation();
+    if (onHandle) event.preventDefault();
+    const originY = event.clientY;
+    const originScroll = options.scroll ? options.scroll.scrollTop : 0;
+    const original = value;
+    let moved = false;
+    const move = (nextEvent) => {
+      if (nextEvent.pointerId !== event.pointerId) return;
+      const delta = nextEvent.clientY - originY + (options.scroll ? options.scroll.scrollTop - originScroll : 0);
+      if (!moved && Math.abs(delta) < 5) return;
+      moved = true;
+      nextEvent.preventDefault();
+      paint(snapDailyPlanMinute(original + delta / PLANNER_PIXELS_PER_MINUTE,
+        options.minimum, options.maximum, original));
+    };
+    const cleanup = () => {
+      element.removeEventListener('pointermove', move);
+      element.removeEventListener('pointerup', finish);
+      element.removeEventListener('pointercancel', cancel);
+      element.removeEventListener('lostpointercapture', cancel);
+      document.removeEventListener('keydown', escape, true);
+      if (element.hasPointerCapture && element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+      if (view.cancelDailyMove === abort) view.cancelDailyMove = null;
+    };
+    const abort = () => { cleanup(); paint(original); suppressClick = moved; };
+    const cancel = (nextEvent) => { if (nextEvent.pointerId === event.pointerId) abort(); };
+    const escape = (nextEvent) => {
+      if (nextEvent.key !== 'Escape') return;
+      nextEvent.preventDefault();
+      nextEvent.stopPropagation();
+      abort();
+    };
+    const finish = (nextEvent) => {
+      if (nextEvent.pointerId !== event.pointerId) return;
+      move(nextEvent);
+      cleanup();
+      suppressClick = moved;
+      if (moved && value !== original) commit(value);
+    };
+    view.cancelDailyMove = abort;
+    element.addEventListener('pointermove', move);
+    element.addEventListener('pointerup', finish);
+    element.addEventListener('pointercancel', cancel);
+    element.addEventListener('lostpointercapture', cancel);
+    document.addEventListener('keydown', escape, true);
+    if (element.setPointerCapture) element.setPointerCapture(event.pointerId);
+  };
+  element.addEventListener('pointerdown', begin);
+  for (const control of handles) {
+    if (control !== element) control.addEventListener('pointerdown', begin);
+    control.addEventListener('keydown', (event) => {
+      if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      activeHandle = control;
+      const requested = event.key === 'Home' ? options.minimum : event.key === 'End' ? options.maximum
+        : value + (event.key === 'ArrowUp' ? -15 : 15);
+      const next = snapDailyPlanMinute(requested, options.minimum, options.maximum, value);
+      if (next === value) return;
+      paint(next);
+      commit(next);
+    });
+  }
 }
 
 function wireTimedTaskResize(plugin, item, card, view) {
@@ -10592,6 +10871,7 @@ class PlannerBoardView extends ItemView {
 
   async onClose() {
     this.routineViewClosed = true;
+    if (this.cancelDailyMove) this.cancelDailyMove();
     if (this.routineDetailModal) this.routineDetailModal.close();
     if (this.nowRailInterval != null) {
       window.clearInterval(this.nowRailInterval);
@@ -10632,6 +10912,7 @@ class PlannerBoardView extends ItemView {
   }
 
   render() {
+    if (this.cancelDailyMove) this.cancelDailyMove();
     const el = this.contentEl;
     el.dataset.layout = this.layout;
     el.empty();
@@ -10766,9 +11047,16 @@ class PlannerBoardView extends ItemView {
       colHead.createSpan({ cls: 'iplan-day-name', text: DAY_NAMES[dayIdx] });
       colHead.createSpan({ cls: 'iplan-day-date', text: fmtDayNum(day) });
       if (day === today) colHead.createSpan({ cls: 'iplan-day-now', text: 'NOW' });
+      const resetWorkday = colHead.createEl('button', { cls: 'iplan-nav-btn', attr: { type: 'button',
+        title: 'Reset planned workday', 'aria-label': `Reset planned workday on ${day}`, 'data-plan-focus': `workday-reset:${day}` } });
+      setIcon(resetWorkday, 'rotate-ccw');
+      resetWorkday.addEventListener('click', () => {
+        this.pendingPlanFocus = `workday-reset:${day}`;
+        this.plugin.setDailyPlannedTime(day, null, null);
+      });
 
       const capacityRoutines = routineOccurrences(this.plugin.routines || [], day,
-        this.plugin.splitHM(), routineDefaultsOf(this.plugin.settings));
+        this.plugin.splitHM(), routineDefaultsOf(this.plugin.settings), this.plugin.settings._dailyPlanOverrides);
       renderDailyPlannedTime(col, day, dailyPlannedTime(day, this.plugin.settings,
         capacityCalendars.events, items, capacityRoutines), capacityCalendars, capacityCalendars.cached.length > 0);
 
@@ -10810,6 +11098,11 @@ class PlannerBoardView extends ItemView {
     foot.createSpan({ text: stamp });
     foot.createSpan({ cls: 'iplan-foot-dot', text: ' · ' });
     foot.createSpan({ text: fmtOpenItems(items.filter((i) => !isDone(i)).length) });
+    if (this.pendingPlanFocus && !this.routineDetailModal) {
+      const focus = el.querySelector(`[data-plan-focus="${CSS.escape(this.pendingPlanFocus)}"]`);
+      if (focus) focus.focus({ preventScroll: true });
+      this.pendingPlanFocus = null;
+    }
   }
 
   renderOverviewDay(day, col, items, events, routines) {
@@ -10938,17 +11231,26 @@ class PlannerBoardView extends ItemView {
     if (labelOverflow) labelOverflow.hidden = true;
     const scroll = col.createDiv({ cls: 'iplan-time-scroll' });
     const canvas = scroll.createDiv({ cls: 'iplan-time-canvas' });
-    if (outside) canvas.addClass('has-outside-routine-labels');
+    const workday = workdayFor(day, this.plugin.settings);
+    const hasGutter = outside || workday.end > workday.start;
+    if (hasGutter) canvas.addClass('has-outside-routine-labels');
     canvas.style.height = `${height}px`;
-    const axis = canvas.createDiv({ cls: 'iplan-time-axis', attr: { 'aria-hidden': 'true' } });
-    for (let minute = bounds.start; minute <= bounds.end; minute += 60) {
-      const label = axis.createDiv({ cls: 'iplan-time-label', text: plannedStartText(minute) });
-      label.style.top = `${(minute - bounds.start) * PLANNER_PIXELS_PER_MINUTE}px`;
-    }
+    const axis = canvas.createDiv({ cls: 'iplan-time-axis' });
     const slots = canvas.createDiv({ cls: 'iplan-time-slots', attr: { 'data-day': day } });
     slots.style.height = `${height}px`;
-    const labelGutter = outside ? canvas.createDiv({ cls: 'iplan-routine-label-gutter' }) : null;
-    const grid = { day, start: bounds.start, end: bounds.end, entries, slots, scroll, canvas, labelGutter, labelOverflow };
+    const labelGutter = hasGutter ? canvas.createDiv({ cls: 'iplan-routine-label-gutter' }) : null;
+    const workdayLabels = this.renderTimedWorkdayMarkers(day, axis, slots, bounds, scroll, labelGutter);
+    const hourLabels = [];
+    for (let minute = bounds.start; minute <= bounds.end; minute += 60) {
+      const top = (minute - bounds.start) * PLANNER_PIXELS_PER_MINUTE;
+      const label = axis.createDiv({ cls: 'iplan-time-label', text: plannedStartText(minute), attr: { 'aria-hidden': 'true' } });
+      label.style.top = `${top}px`;
+      hourLabels.push({ element: label, top });
+    }
+    const grid = { day, start: bounds.start, end: bounds.end, entries, slots, scroll, canvas, labelGutter, labelOverflow,
+      workdayLabels, hourLabels, initialScrollPending: !this.timeScrollPositions.has(day),
+      pendingSavedScrollTop: this.timeScrollPositions.has(day) ? this.timeScrollPositions.get(day) : null,
+      lastScrollTop: scroll.scrollTop };
     this.timedGrids.set(day, grid);
     if (labelOverflow) labelOverflow.addEventListener('click', () => {
       if (grid.hiddenRoutineEntries.length) {
@@ -10997,13 +11299,31 @@ class PlannerBoardView extends ItemView {
       entry.element = element;
       element.style.top = `${(entry.start - bounds.start) * PLANNER_PIXELS_PER_MINUTE}px`;
       element.style.height = `${entry.duration * PLANNER_PIXELS_PER_MINUTE}px`;
+      if (entry.kind === 'routine') {
+        const handle = element.createEl('button', { cls: 'iplan-plan-move', attr: { type: 'button', 'data-plan-focus': entry.key } });
+        setIcon(handle, 'move-vertical');
+        wireDailyPlanMove(element, handle, this, {
+          value: entry.start, minimum: 0, maximum: 1440 - entry.duration, scroll,
+          label: `Planned start for ${entry.occ.routine.name} on ${day}`,
+          preview: (start) => {
+            entry.start = start;
+            entry.end = start + entry.duration;
+            if (entry.element && this.timedGrids.has(day)) this.relayoutTimedGrid(day);
+          },
+          save: (start) => this.plugin.setDailyPlannedTime(day, entry.occ.routine.path, { start }),
+        });
+      }
     }
 
-    const initialScroll = this.timeScrollPositions.has(day)
-      ? this.timeScrollPositions.get(day)
-      : hmToMin(this.plugin.settings.dayStart, 480) * PLANNER_PIXELS_PER_MINUTE;
-    scroll.scrollTop = initialScroll;
-    scroll.addEventListener('scroll', () => this.timeScrollPositions.set(day, scroll.scrollTop));
+    scroll.addEventListener('scroll', () => {
+      if (!scroll.getClientRects().length) return;
+      if (scroll.scrollTop === grid.lastScrollTop
+        && (grid.pendingSavedScrollTop != null || grid.initialScrollPending)) return;
+      grid.lastScrollTop = scroll.scrollTop;
+      grid.pendingSavedScrollTop = null;
+      grid.initialScrollPending = false;
+      this.timeScrollPositions.set(day, scroll.scrollTop);
+    });
     wireTimedDrop(slots, grid, (path, start) => {
       const item = items.find((candidate) => candidate.path === path);
       if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start),
@@ -11013,9 +11333,111 @@ class PlannerBoardView extends ItemView {
 
   }
 
+  renderTimedWorkdayMarkers(day, axis, slots, bounds, scroll, labelGutter) {
+    const { start, end } = workdayFor(day, this.plugin.settings);
+    if (end <= start) return [];
+    const labels = [];
+    for (const [kind, minute] of [['start', start], ['end', end]]) {
+      if (minute < bounds.start || minute > bounds.end) continue;
+      const time = minute === 1440 ? '24:00' : plannedStartText(minute);
+      const label = axis.createEl('button', { cls: `iplan-time-label iplan-workday-label is-${kind}`,
+        attr: { type: 'button', 'aria-label': `Workday ${kind} ${time}`, 'data-plan-focus': `workday:${day}:${kind}` } });
+      const clock = label.createSpan({ text: time });
+      const title = labelGutter ? labelGutter.createEl('button', {
+        cls: `iplan-workday-title is-${kind}`, text: `Workday ${kind}`,
+        attr: { type: 'button', 'data-plan-focus': `workday-title:${day}:${kind}` },
+      }) : null;
+      const anchor = (minute - bounds.start) * PLANNER_PIXELS_PER_MINUTE;
+      const marker = { element: label, titleElement: title, kind, anchor };
+      labels.push(marker);
+      const line = slots.createDiv({ cls: `iplan-workday-line is-${kind}`, attr: { 'aria-hidden': 'true' } });
+      marker.lineElement = line;
+      line.style.top = `${anchor}px`;
+      wireDailyPlanMove(label, label, this, {
+        value: minute, minimum: kind === 'start' ? 0 : start + 1,
+        maximum: kind === 'start' ? end - 1 : 1440, scroll,
+        additionalHandles: title ? [title] : [],
+        label: `Planned workday ${kind} on ${day}`,
+        preview: (next) => {
+          marker.anchor = (next - bounds.start) * PLANNER_PIXELS_PER_MINUTE;
+          line.style.top = `${marker.anchor}px`;
+          clock.textContent = next === 1440 ? '24:00' : plannedStartText(next);
+          const grid = this.timedGrids.get(day);
+          if (grid) this.relayoutTimedGrid(day);
+        },
+        save: (next) => this.plugin.setDailyPlannedTime(day, null, { [kind]: next }),
+      });
+    }
+    this.placeTimedWorkdayMarkers(labels, (bounds.end - bounds.start) * PLANNER_PIXELS_PER_MINUTE);
+    return labels;
+  }
+
+  placeTimedWorkdayMarkers(labels, height, hourLabels = []) {
+    for (const hour of hourLabels) if (hour.element.hidden) hour.element.hidden = false;
+    const labelHeights = labels.map((label) => label.element.getBoundingClientRect().height);
+    const hourHeights = hourLabels.map((hour) => hour.element.getBoundingClientRect().height / 2);
+    for (const [index, label] of labels.entries()) {
+      label.height = labelHeights[index];
+      label.lineOffset = label.lineElement ? (label.lineElement.parentElement.clientTop || 0) : label.lineOffset || 0;
+      label.lineHalfHeight = label.lineElement ? label.lineElement.getBoundingClientRect().height / 2 : label.lineHalfHeight || 0;
+      const center = label.anchor + label.lineOffset + label.lineHalfHeight;
+      label.top = Math.max(0, Math.min(height - label.height,
+        center - label.height / 2));
+      label.bottom = label.top + label.height;
+    }
+    if (labels.length === 2 && labels[0].bottom > labels[1].top) {
+      labels[1].top = Math.min(height - labels[1].height, Math.max(labels[0].height, labels[1].top));
+      labels[0].top = Math.max(0, labels[1].top - labels[0].height);
+      labels[0].bottom = labels[0].top + labels[0].height;
+      labels[1].bottom = labels[1].top + labels[1].height;
+    }
+    for (const label of labels) {
+      label.element.style.top = `${label.top}px`;
+      label.element.style.setProperty('--iplan-workday-anchor', `${label.anchor + label.lineOffset - label.top}px`);
+      const center = label.anchor + label.lineOffset + label.lineHalfHeight - label.top;
+      label.element.style.setProperty('--iplan-workday-leader-top', `${Math.min(center, label.height / 2)}px`);
+      label.element.style.setProperty('--iplan-workday-leader-height', `${Math.abs(center - label.height / 2)}px`);
+    }
+    for (const [index, hour] of hourLabels.entries()) {
+      const halfHeight = hourHeights[index];
+      hour.element.hidden = labels.some((boundary) => hour.top + halfHeight >= boundary.top
+        && hour.top - halfHeight <= boundary.bottom);
+    }
+    const titles = labels.filter((label) => label.titleElement).map((label) => ({
+      element: label.titleElement, kind: label.kind, anchor: label.anchor, marker: label,
+      lineOffset: label.lineOffset, lineHalfHeight: label.lineHalfHeight,
+    }));
+    if (titles.length) {
+      this.placeTimedWorkdayMarkers(titles, height);
+      for (const title of titles) {
+        title.marker.titleTop = title.top;
+        title.marker.titleBottom = title.bottom;
+        title.marker.titleHeight = title.height;
+      }
+    }
+  }
+
   relayoutTimedGrid(day) {
     const grid = this.timedGrids.get(day);
     if (!grid) return;
+    if (grid.pendingSavedScrollTop != null && grid.canvas.getClientRects().length
+      && grid.scroll.getBoundingClientRect().height > 0) {
+      grid.scroll.scrollTop = grid.pendingSavedScrollTop;
+      grid.lastScrollTop = grid.scroll.scrollTop;
+      grid.pendingSavedScrollTop = null;
+    }
+    if (grid.workdayLabels && grid.canvas.getClientRects().length) {
+      this.placeTimedWorkdayMarkers(grid.workdayLabels,
+        (grid.end - grid.start) * PLANNER_PIXELS_PER_MINUTE, grid.hourLabels);
+      if (grid.initialScrollPending && grid.workdayLabels.every((label) => label.height > 0
+        && (!label.titleElement || label.titleHeight > 0))) {
+        const startTop = (workdayFor(day, this.plugin.settings).start - grid.start) * PLANNER_PIXELS_PER_MINUTE;
+        grid.scroll.scrollTop = Math.min(startTop, ...grid.workdayLabels.map((label) =>
+          Math.min(label.top, label.titleTop ?? label.top)));
+        grid.lastScrollTop = grid.scroll.scrollTop;
+        grid.initialScrollPending = false;
+      }
+    }
     for (const entry of grid.entries) {
       if (entry.kind !== 'task') continue;
       const duration = plannedDuration(entry.item.plannedDuration);
@@ -11040,7 +11462,13 @@ class PlannerBoardView extends ItemView {
       entry.labelElement.hidden = false;
       const labelHeight = entry.labelElement.getBoundingClientRect().height;
       const anchor = (entry.start - grid.start + entry.duration / 2) * PLANNER_PIXELS_PER_MINUTE;
-      const top = Math.max(0, Math.min(height - labelHeight, anchor - labelHeight / 2));
+      const preferred = Math.max(0, Math.min(height - labelHeight, anchor - labelHeight / 2));
+      const boundaries = (grid.workdayLabels || []).filter((marker) => marker.titleElement);
+      const candidates = [preferred, 0, height - labelHeight,
+        ...boundaries.flatMap((marker) => [marker.titleTop - labelHeight, marker.titleBottom])];
+      const top = candidates.filter((candidate) => candidate >= 0 && candidate + labelHeight <= height
+        && boundaries.every((marker) => candidate + labelHeight <= marker.titleTop || candidate >= marker.titleBottom))
+        .sort((first, second) => Math.abs(first - preferred) - Math.abs(second - preferred) || first - second)[0] ?? preferred;
       return { key: entry.key, start: top, end: top + labelHeight, anchor, labelHeight, entry };
     });
     if (!labels.length) return;
@@ -11101,12 +11529,7 @@ class PlannerBoardView extends ItemView {
   // The live day-progress marker on today's column (cockpit's progress rail).
   updateNowRail() {
     if (!this._todayCol || !this._nowRail || !this._todayCol.isConnected) return;
-    const parse = (hm, fallback) => {
-      const m = /^(\d{1,2}):(\d{2})$/.exec(hm || '');
-      return m ? Number(m[1]) * 60 + Number(m[2]) : fallback;
-    };
-    const start = parse(this.plugin.settings.dayStart, 480);
-    const end = parse(this.plugin.settings.dayEnd, 1080);
+    const { start, end } = workdayFor(todayStr(), this.plugin.settings);
     const now = new Date();
     const mins = now.getHours() * 60 + now.getMinutes();
     const clockMins = mins + now.getSeconds() / 60 + now.getMilliseconds() / 60000;
@@ -11136,7 +11559,7 @@ class PlannerBoardView extends ItemView {
       this._nowRail.style.removeProperty('--iplan-now-top');
     }
     if (this._countdown && this._countdown.wrap.isConnected) {
-      const seg = segmentInfo(this.plugin.settings, mins);
+      const seg = segmentInfo(this.plugin.settings, mins, todayStr());
       // A class, never an inline display: an inline style is out of reach of
       // the stylesheet and of a theme, and this element already carries a
       // display of its own that an inline '' would have to fall back to.
@@ -13139,6 +13562,8 @@ module.exports.__test = {
   PLAN_OWNED_ITEM_FIELDS, normalizeLinkedNote, PINNED_SECTION_HEAD,
   ROUTINE_TYPE, ROUTINE_TYPES, ROUTINE_LOG_SENTINEL, ROUTINE_LOG_SECTION, WEEKDAY_CODES, LANE_KIND_RANK,
   dayCode, normalizeWeekdays, routineTypeOf, normalizeHM, routineDefaultsOf, routineWeekdaysDefaultOf,
+  planMinute, planDayValid, normalizeDailyPlanOverrides, workdayFor,
+  snapDailyPlanMinute,
   routineSteps, parseRoutineNote, routineRowState, routineHalf, routineOccurrence, routineOccurrences,
   routineCardState, routineKicker, routineTimeLabel, routineLogAfterStep, routineLogSkipped, routineLogReset,
   validateRoutineInput, routineTemplate,

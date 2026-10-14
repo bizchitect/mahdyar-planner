@@ -46,6 +46,52 @@ const BODY = [
 
 const routine = (fm, body, p) => T.parseRoutineNote(Object.assign({}, FM, fm || {}), body == null ? BODY : body, p || '02 Planner/Routines/Morning launch.md');
 
+function dailyPlanPlugin(routines = [routine()]) {
+  const plugin = Object.create(T.IcorPlannerPlugin.prototype);
+  plugin.settings = { ...T.DEFAULT_SETTINGS, _dailyPlanOverrides: {} };
+  plugin.secrets = new T.SecretVault(null);
+  plugin.routines = routines;
+  plugin.planFiles = new Map(routines.map((current) => [current.path,
+    Object.assign(new T.__obsidian.TFile(), { path: current.path })]));
+  plugin.app = { vault: { getAbstractFileByPath: (routinePath) => plugin.planFiles.get(routinePath) } };
+  plugin.emitModelChanged = () => {};
+  plugin.saveData = async () => {};
+  return plugin;
+}
+
+test('daily plan overrides isolate dates, inherit defaults and clip lunch to moved workday bounds', () => {
+  const morning = routine();
+  const settings = { ...T.DEFAULT_SETTINGS, lunchEnabled: true, lunchStart: '12:30', lunchEnd: '13:30',
+    _dailyPlanOverrides: { '2026-09-07': { workday: { start: 540, end: 1020 },
+      routines: { [morning.path]: { start: 435, end: 495 } } } } };
+  const occurrences = T.routineOccurrences([morning], '2026-09-07', '13:00', T.routineDefaultsOf(settings), settings._dailyPlanOverrides);
+  assert.deepEqual([occurrences[0].startMin, occurrences[0].endMin], [435, 495]);
+  assert.equal(T.dailyPlannedTime('2026-09-07', settings, [], [], occurrences).dayMin, 420);
+  assert.deepEqual(T.workdayFor('2026-09-08', settings), { start: 480, end: 1080 });
+  const tuesday = T.routineOccurrences([morning], '2026-09-08', '13:00', T.routineDefaultsOf(settings), settings._dailyPlanOverrides)[0];
+  assert.deepEqual([tuesday.startMin, tuesday.endMin], [390, 450]);
+  const partial = { ...settings, dayEnd: '19:00', _dailyPlanOverrides: { '2026-09-07': { workday: { start: 540 } } } };
+  assert.deepEqual(T.workdayFor('2026-09-07', partial), { start: 540, end: 1140 });
+  const inherited = routine({ start: null, end: null });
+  const defaults = T.routineDefaultsOf({ routineDefaults: { morning: { start: '08:00', end: '08:45' } } });
+  assert.equal(T.routineOccurrence(inherited, '2026-09-08', '13:00', defaults, settings._dailyPlanOverrides).startMin, 480);
+  assert.equal(T.routineOccurrence(morning, '2026-09-08', '13:00', defaults, {}).startMin, 390);
+  assert.equal(morning.start, '06:30');
+  assert.equal(morning.log.rows.length, 3);
+});
+
+test('daily plan normalization survives JSON reload and rejects invalid dates and intervals', () => {
+  const path = routine().path;
+  const valid = { '2026-09-07': { workday: { end: '24:00' }, routines: { [path]: { start: '23:15', end: 1440 } } } };
+  const normalized = T.normalizeDailyPlanOverrides(valid);
+  assert.deepEqual(T.normalizeDailyPlanOverrides(JSON.parse(JSON.stringify(normalized))), normalized);
+  const adopted = T.adoptSettings(JSON.parse(JSON.stringify({ _dailyPlanOverrides: normalized })), new T.SecretVault(null));
+  assert.deepEqual(adopted.settings._dailyPlanOverrides, normalized);
+  assert.deepEqual(T.normalizeDailyPlanOverrides({ '2026-02-30': valid['2026-09-07'],
+    '2026-09-08': { workday: { start: 600, end: 600 }, routines: { [path]: { start: 600, end: 599 } } } }), {});
+  for (const invalid of [1.5, -1, 1441, null, true, '25:00', '12:60', '24:01']) assert.equal(T.planMinute(invalid), null);
+});
+
 test('daily planned time uses free time as the buffer percentage denominator', () => {
   const day = '2026-09-07';
   const events = [{ start: `${day}T09:00:00`, end: `${day}T11:00:00` }];
@@ -56,6 +102,249 @@ test('daily planned time uses free time as the buffer percentage denominator', (
     dayMin: 600, lunchMin: 0, meetingsMin: 120, plannedMin: 180, freeMin: 480,
     bufferMin: 300, bufferPercent: 62.5, unknownTasks: 0,
   });
+});
+
+test('SOURCE: daily plan is shared by display and capacity without connector or completion writes', () => {
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const display = main.slice(main.indexOf('  routinesFor(day)'), main.indexOf('  async processRoutine('));
+  assert.match(display, /routinesEnabled === false/);
+  assert.match(display, /this\.settings\._dailyPlanOverrides/);
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
+  assert.match(board, /routineDefaultsOf\(this\.plugin\.settings\), this\.plugin\.settings\._dailyPlanOverrides/);
+  assert.match(board, /workdayFor\(day, this\.plugin\.settings\)/);
+  assert.match(board, /workdayFor\(todayStr\(\), this\.plugin\.settings\)/);
+  assert.match(board, /segmentInfo\(this\.plugin\.settings, mins, todayStr\(\)\)/);
+  const writes = main.slice(main.indexOf('  updateDailyPlan(change)'), main.indexOf('  /* ---- the secrets backend'));
+  assert.match(writes, /return this\.persistSettings\(async \(save\) =>/);
+  assert.match(writes, /await save\(\{ _dailyPlanOverrides: normalized \}\);\s*this\.settings\._dailyPlanOverrides = normalized/);
+  assert.match(writes, /await save\(\{ _dailyPlanOverrides: before \}\)/);
+  assert.match(writes, /could not be saved or restored on disk/);
+  assert.doesNotMatch(writes, /_dailyPlanQueue|await this\.persistSettings/);
+  assert.match(writes, /this\.routinesFor\(day\)\.find/);
+  assert.match(writes, /file instanceof TFile/);
+  assert.match(writes, /file\.path !== path/);
+  assert.doesNotMatch(writes, /saveSettings|scheduleSync|syncNow|processFrontMatter|processRoutine|vault\.process|requestUrl|routineLog|occurrences/);
+  const rename = main.slice(main.indexOf("this.app.vault.on('rename'"), main.indexOf('  // Every path, derived'));
+  assert.match(rename, /path !== oldPath && !path\.startsWith\(`\$\{oldPath\}\/`\)/);
+  assert.match(rename, /entry\.routines\[next\] = entry\.routines\[path\]/);
+  assert.match(rename, /delete entry\.routines\[path\]/);
+  const modal = main.slice(main.indexOf('class RoutineDetailModal'), main.indexOf('function showRoutineMenu('));
+  assert.match(modal, /change\(\{ start \}\)/);
+  assert.doesNotMatch(modal, /const duration = occurrence\.endMin - occurrence\.startMin/);
+  assert.match(board, /this\.renderTimedWorkdayMarkers\(day, axis, slots, bounds, scroll, labelGutter\)/);
+  const markers = board.slice(board.indexOf('  renderTimedWorkdayMarkers('), board.indexOf('  placeTimedWorkdayMarkers('));
+  assert.match(markers, /renderTimedWorkdayMarkers\(day, axis, slots, bounds, scroll, labelGutter\)/);
+  assert.match(markers, /wireDailyPlanMove\(label, label, this, \{[\s\S]*?maximum:[^\n]+, scroll,/);
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  assert.match(css, /button\.iplan-workday-label\s*\{[^}]*pointer-events:\s*auto/);
+  assert.match(css, /\.iplan-workday-line\s*\{[^}]*pointer-events:\s*none/);
+  const handle = css.match(/button\.iplan-plan-move\s*\{([^}]+)\}/)[1];
+  assert.match(handle, /height:\s*min\(100%, var\(--size-4-6\)\)/);
+  assert.doesNotMatch(handle, /min-height/);
+});
+
+test('daily plan writes queue rapid changes, recover from failure and reset without note or sync writes', async () => {
+  const plugin = dailyPlanPlugin();
+  const path = routine().path;
+  const day = '2026-09-07';
+  let notifications = 0;
+  let fail = false;
+  const saved = [];
+  plugin.emitModelChanged = () => { notifications += 1; };
+  plugin.saveData = async (snapshot) => {
+    if (fail) { fail = false; throw new Error('Save rejected'); }
+    saved.push(snapshot._dailyPlanOverrides);
+  };
+  const first = plugin.setDailyPlannedTime(day, path, { start: 435, end: 482 });
+  const second = plugin.setDailyPlannedTime(day, path, { start: 450, end: 497 });
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+  assert.equal(saved[0][day].routines[path].start, 435);
+  assert.equal(saved[1][day].routines[path].start, 450);
+  fail = true;
+  const rejected = plugin.setDailyPlannedTime(day, path, { start: 465, end: 512 });
+  const newer = plugin.setDailyPlannedTime(day, null, { start: 540 });
+  assert.deepEqual(await Promise.all([rejected, newer]), [false, true]);
+  assert.equal(plugin.settings._dailyPlanOverrides[day].routines[path].start, 450);
+  assert.equal(plugin.settings._dailyPlanOverrides[day].workday.start, 540);
+  assert.equal(await plugin.setDailyPlannedTime(day, null, { end: 540 }), false);
+  assert.equal(await plugin.setDailyPlannedTime(day, null, { end: '25:00' }), false);
+  assert.equal(await plugin.setDailyPlannedTime('2026-02-30', path, { start: 450, end: 497 }), false);
+  assert.equal(await plugin.setDailyPlannedTime(day, 'outside.md', { start: 450, end: 497 }), false);
+  await plugin.setDailyPlannedTime(day, path, null);
+  assert.equal(plugin.settings._dailyPlanOverrides[day].routines, undefined);
+  await plugin.setDailyPlannedTime(day, null, null);
+  assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+  assert.ok(notifications > 0);
+});
+
+test('real settings queue isolates a rejected plan between ordinary saves and restores partial writes', async () => {
+  for (const partialWrite of [false, true]) {
+    const plugin = dailyPlanPlugin();
+    const day = '2026-09-07';
+    let releaseEarlier;
+    let beganEarlier;
+    let releasePlan;
+    let beganPlan;
+    const earlierStarted = new Promise((resolve) => { beganEarlier = resolve; });
+    const earlierGate = new Promise((resolve) => { releaseEarlier = resolve; });
+    const planStarted = new Promise((resolve) => { beganPlan = resolve; });
+    const planGate = new Promise((resolve) => { releasePlan = resolve; });
+    const settle = plugin.secrets.settle.bind(plugin.secrets);
+    let firstSettle = true;
+    plugin.secrets.settle = async () => {
+      if (firstSettle) { firstSettle = false; beganEarlier(); await earlierGate; }
+      await settle();
+    };
+    let disk;
+    const snapshots = [];
+    plugin.saveData = async (snapshot) => {
+      snapshots.push(snapshot);
+      if (snapshots.length === 2) {
+        beganPlan();
+        await planGate;
+        if (partialWrite) disk = snapshot;
+        throw new Error('Plan save rejected');
+      }
+      disk = snapshot;
+    };
+    const earlier = plugin.persistSettings();
+    await earlierStarted;
+    const rejected = plugin.setDailyPlannedTime(day, null, { start: 540 });
+    await Promise.resolve();
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+    assert.equal(snapshots.length, 0);
+    releaseEarlier();
+    await earlier;
+    await planStarted;
+    assert.deepEqual(snapshots[0]._dailyPlanOverrides, {});
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+    plugin.settings.dayEnd = '19:00';
+    const later = plugin.persistSettings();
+    releasePlan();
+    assert.equal(await rejected, false);
+    await later;
+    assert.equal(snapshots.length, 4);
+    assert.deepEqual(snapshots[2]._dailyPlanOverrides, {});
+    assert.deepEqual(disk._dailyPlanOverrides, plugin.settings._dailyPlanOverrides);
+    assert.deepEqual(T.adoptSettings(JSON.parse(JSON.stringify(disk)), new T.SecretVault(null)).settings._dailyPlanOverrides, {});
+    assert.equal(disk.dayEnd, '19:00');
+    assert.equal(plugin.settings.dayEnd, '19:00');
+  }
+});
+
+test('real settings queue continues after an earlier failure and after a failed disk restoration', async () => {
+  for (const failure of ['earlier', 'restore']) {
+    const plugin = dailyPlanPlugin();
+    const day = '2026-09-07';
+    let attempts = 0;
+    let disk;
+    plugin.saveData = async (snapshot) => {
+      attempts += 1;
+      if (attempts === 1 || (failure === 'restore' && attempts === 2)) {
+        disk = snapshot;
+        throw new Error('Save rejected');
+      }
+      disk = snapshot;
+    };
+    const first = failure === 'earlier' ? plugin.persistSettings().catch(() => false)
+      : plugin.setDailyPlannedTime(day, null, { start: 540 });
+    assert.equal(await first, false);
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+    if (failure === 'restore') assert.equal(disk._dailyPlanOverrides[day].workday.start, 540);
+    const newer = plugin.setDailyPlannedTime(day, null, { start: 555 });
+    const latest = plugin.setDailyPlannedTime(day, null, { start: 570 });
+    assert.deepEqual(await Promise.all([newer, latest]), [true, true]);
+    assert.equal(plugin.settings._dailyPlanOverrides[day].workday.start, 570);
+    assert.deepEqual(disk._dailyPlanOverrides, plugin.settings._dailyPlanOverrides);
+  }
+});
+
+test('queued routine moves reject stale or unknown paths and use current source and override durations', async () => {
+  const day = '2026-09-07';
+  for (const stale of ['deleted', 'renamed', 'folder-renamed', 'not-live', 'not-file']) {
+    const current = routine();
+    const plugin = dailyPlanPlugin([current]);
+    const oldPath = current.path;
+    let release;
+    let began;
+    const started = new Promise((resolve) => { began = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    let saves = 0;
+    plugin.saveData = async () => { saves += 1; if (saves === 1) { began(); await gate; } };
+    const earlier = plugin.persistSettings();
+    await started;
+    const move = plugin.setDailyPlannedTime(day, oldPath, { start: 435 });
+    if (stale === 'deleted') plugin.planFiles.delete(oldPath);
+    if (stale === 'not-live') plugin.routines = [];
+    if (stale === 'not-file') plugin.planFiles.set(oldPath, new T.__obsidian.TFolder());
+    if (stale === 'renamed' || stale === 'folder-renamed') {
+      const nextPath = stale === 'renamed' ? '02 Planner/Routines/Renamed.md'
+        : '02 Planner/Routines/Renamed folder/Morning launch.md';
+      const file = plugin.planFiles.get(oldPath);
+      file.path = nextPath;
+      plugin.planFiles.delete(oldPath);
+      plugin.planFiles.set(nextPath, file);
+      plugin.routines = [routine({}, BODY, nextPath)];
+    }
+    release();
+    await earlier;
+    assert.equal(await move, false, stale);
+    assert.equal(saves, 1, stale);
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, {}, stale);
+    assert.equal(await plugin.setDailyPlannedTime(day, oldPath, null), false, stale);
+  }
+  const plugin = dailyPlanPlugin();
+  const currentPath = routine().path;
+  assert.equal(await plugin.setDailyPlannedTime(day, '02 Planner/Routines/Unknown.md', { start: 435 }), false);
+  plugin.routines = [routine({ start: '06:30', end: '07:17' })];
+  assert.equal(await plugin.setDailyPlannedTime(day, currentPath, { start: 435 }), true);
+  assert.deepEqual(plugin.settings._dailyPlanOverrides[day].routines[currentPath], { start: 435, end: 482 });
+  await plugin.setDailyPlannedTime(day, currentPath, { start: 450, end: 467 });
+  assert.equal(await plugin.setDailyPlannedTime(day, currentPath, { start: 480 }), true);
+  assert.deepEqual(plugin.settings._dailyPlanOverrides[day].routines[currentPath], { start: 480, end: 497 });
+  assert.equal(await plugin.setDailyPlannedTime(day, currentPath, { start: 1435 }), false);
+  assert.equal(await plugin.setDailyPlannedTime(day, currentPath, null), true);
+  assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+  assert.equal(plugin.routines[0].end, '07:17');
+});
+
+test('settings persistence serializes immutable snapshots and continues after a rejected save', async () => {
+  const plugin = Object.create(T.IcorPlannerPlugin.prototype);
+  plugin.settings = { ...T.DEFAULT_SETTINGS, _dailyPlanOverrides: {} };
+  plugin.secrets = new T.SecretVault(null);
+  let release;
+  let began;
+  const started = new Promise((resolve) => { began = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const snapshots = [];
+  plugin.saveData = async (snapshot) => {
+    snapshots.push(snapshot);
+    if (snapshots.length === 1) { began(); await gate; throw new Error('Save rejected'); }
+  };
+  const first = plugin.persistSettings().catch(() => false);
+  await started;
+  plugin.settings._dailyPlanOverrides = { '2026-09-07': { workday: { start: 540 } } };
+  const second = plugin.persistSettings();
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0]._dailyPlanOverrides, {});
+  release();
+  assert.equal(await first, false);
+  await second;
+  assert.equal(snapshots.length, 2);
+  assert.equal(snapshots[1]._dailyPlanOverrides['2026-09-07'].workday.start, 540);
+});
+
+test('daily plan snapping preserves odd routine durations and never crosses midnight or reversed workdays', () => {
+  const duration = 47;
+  const start = T.snapDailyPlanMinute(435, 0, 1440 - duration, 390);
+  assert.equal(start, 435);
+  assert.equal(start + duration, 482);
+  assert.equal(T.snapDailyPlanMinute(-100, 0, 1440 - duration, 390), 0);
+  assert.equal(T.snapDailyPlanMinute(1500, 0, 1440 - duration, 390), 1380);
+  assert.equal(T.snapDailyPlanMinute(540, 0, 539, 480), 525);
+  assert.equal(T.snapDailyPlanMinute(525, 541, 1440, 1080), 555);
+  assert.equal(T.snapDailyPlanMinute(0, 1, 1, 1), 1);
+  assert.equal(T.snapPlannerMinute(435), 450);
 });
 
 test('daily capacity subtracts enabled lunch once without excluding lunch from meetings or planned time', () => {
@@ -404,7 +693,7 @@ test('SOURCE: WEEK and DAY share daily totals while the countdown and visibility
   assert.ok(board.includes('capacityCalendars.events, items, capacityRoutines)'));
   assert.ok(board.includes('capacityCalendars, capacityCalendars.cached.length > 0)'));
   assert.ok(board.includes('const routines = this.plugin.routinesFor(day);'));
-  assert.ok(board.includes('const seg = segmentInfo(this.plugin.settings, mins);'));
+  assert.ok(board.includes('const seg = segmentInfo(this.plugin.settings, mins, todayStr());'));
   assert.ok(board.includes("colHead.insertAdjacentElement('afterend', cd);"));
   assert.ok(main.includes('const capacityDefs = adoptCacheDefs(parsed.defs, calendarFeeds(this.settings));'));
   assert.ok(main.includes('buildCalendarCacheContent(capacityDefs, new Date()'));
@@ -668,13 +957,15 @@ test('the routines folder derives from the planner folder and is created with th
   assert.ok(/await mk\(p\.routines\);/.test(main), 'ensureFolders creates Routines/');
 });
 
-function routineCardFixture(markdownRender) {
+function routineCardFixture(markdownRender, dimensions = {}) {
   const main = fs.readFileSync(T.__mainPath, 'utf8');
   const renderer = main.slice(main.indexOf('function renderRoutineCard('), main.indexOf('function showRoutineMenu('));
   const checklist = markdownRender ? main.slice(main.indexOf('async function renderRoutineStepLabel('),
     main.indexOf('/* ---- the sentinel log table')) : '';
   const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
   const scale = main.match(/const PLANNER_PIXELS_PER_MINUTE\s*=[^;]+;/)[0];
+  const movement = main.slice(main.indexOf('function snapDailyPlanMinute('), main.indexOf('function wireTimedTaskResize('));
+  const documentListeners = {};
   const openedModals = [];
   const openedLinks = [];
   const components = [];
@@ -707,12 +998,28 @@ function routineCardFixture(markdownRender) {
     };
     node.insertBefore = (child, before) => { child.parentElement = node; node.children.splice(node.children.indexOf(before), 0, child); };
     node.matches = (selector) => selector === ':disabled' && !!node.disabled;
+    node.contains = (target) => target === node || node.children.some((child) => child.contains(target));
+    node.closest = (selector) => {
+      const tags = selector.split(',').map((part) => part.trim());
+      for (let current = node; current; current = current.parentElement) {
+        if (tags.includes(current.tagName)) return current;
+      }
+      return null;
+    };
     node.getClientRects = () => {
       for (let ancestor = node; ancestor; ancestor = ancestor.parentElement) {
         if (!ancestor.isConnected || ancestor.hidden || computedStyle(ancestor).display === 'none') return [];
       }
       return [{}];
     };
+    let scrollTop = 0;
+    Object.defineProperty(node, 'scrollTop', {
+      get: () => scrollTop,
+      set: (value) => {
+        if (dimensions.ignoreHiddenScrollAssignments && !node.getClientRects().length) return;
+        scrollTop = value;
+      },
+    });
     node.addClass = (...names) => node.classList.add(...names);
     node.style.setProperty = (name, value) => { node.style[name] = value; };
     node.focus = () => { node.focused = true; };
@@ -744,12 +1051,24 @@ function routineCardFixture(markdownRender) {
       return null;
     };
     node.getBoundingClientRect = () => ({
+      top: parseFloat(node.style.top) || 0,
       left: node.className.includes('iplan-routine-label-gutter') ? 300 : 0,
       right: 100, width: 240,
-      height: node.measuredHeight || parseFloat(node.style.height) || 24,
+      height: node.getClientRects().length ? node.measuredHeight
+        ?? (node.classList.contains('iplan-workday-label') ? dimensions.workdayLabelHeight ?? 24
+          : node.classList.contains('iplan-workday-line') ? 2 : parseFloat(node.style.height) || 24) : 0,
       ...node.measuredRect,
     });
-    node.addEventListener = (name, listener) => { node.listeners[name] = listener; };
+    const registrations = {};
+    node.addEventListener = (name, listener, capture = false) => {
+      (registrations[name] || (registrations[name] = [])).push({ listener, capture: capture === true });
+      node.listeners[name] = (event) => {
+        for (const entry of [...registrations[name]].sort((first, second) => Number(second.capture) - Number(first.capture))) entry.listener(event);
+      };
+    };
+    node.removeEventListener = (name, listener) => {
+      registrations[name] = (registrations[name] || []).filter((entry) => entry.listener !== listener);
+    };
     node.fire = (name, values = {}) => {
       const event = {
         defaultPrevented: false, stopped: false, target: node, ...values,
@@ -770,11 +1089,13 @@ function routineCardFixture(markdownRender) {
     };
     return node;
   };
-  return vm.runInNewContext(`${scale}\n${checklist}\n${renderer}\n${board}\n({ renderRoutineCard, PlannerBoardView, RoutineDetailModal, element, openedModals, openedLinks, components, PLANNER_PIXELS_PER_MINUTE${markdownRender ? ', renderChecklist, renderRoutineStepLabel' : ''} })`, {
-    Set, Map, ItemView: class {
+  return vm.runInNewContext(`${scale}\n${movement}\n${checklist}\n${renderer}\n${board}\n({ renderRoutineCard, PlannerBoardView, RoutineDetailModal, wireDailyPlanMove, documentListeners, element, openedModals, openedLinks, components, PLANNER_PIXELS_PER_MINUTE${markdownRender ? ', renderChecklist, renderRoutineStepLabel' : ''} })`, {
+    Set, Map, documentListeners, ItemView: class {
       constructor(leaf) { this.leaf = leaf || {}; this.leaf.view = this; }
     }, element, openedModals, openedLinks, components, URL,
     document: {
+      addEventListener: (name, listener) => { documentListeners[name] = listener; },
+      removeEventListener: (name, listener) => { if (documentListeners[name] === listener) delete documentListeners[name]; },
       createElement: element,
       createTextNode: (text) => { const node = element('#text'); node.nodeType = 3; node.textContent = text; return node; },
       createDocumentFragment: () => { const node = element('#fragment'); node.nodeType = 11; return node; },
@@ -799,6 +1120,8 @@ function routineCardFixture(markdownRender) {
     timedGridBounds: T.timedGridBounds, timedGridColumns: T.timedGridColumns,
     activeTimedPlacement: T.activeTimedPlacement, plannedDuration: T.plannedDuration,
     localDayStr: T.localDayStr, fmtTimeHM: T.fmtTimeHM, hmToMin: T.hmToMin,
+    workdayFor: T.workdayFor, planMinute: T.planMinute,
+    fmtMin: (minute) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`,
     plannedStartText: (minute) => `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`,
     wireTimedDrop: () => {},
     routineCardState: T.routineCardState, routineKicker: T.routineKicker,
@@ -808,6 +1131,182 @@ function routineCardFixture(markdownRender) {
     wireLongPress: () => {},
   });
 }
+
+test('SIMULATED: plan dragging preserves grab offset, cancels without saving and offers keyboard movement', async () => {
+  const fixture = routineCardFixture();
+  const { wireDailyPlanMove, element, documentListeners, PLANNER_PIXELS_PER_MINUTE } = fixture;
+  const card = element('div');
+  const handle = card.createEl('button', { attr: { 'data-plan-focus': 'routine:Monday' } });
+  const view = {};
+  const previews = [];
+  const saves = [];
+  const scroll = { scrollTop: 321 };
+  wireDailyPlanMove(card, handle, view, { value: 390, minimum: 0, maximum: 1393, scroll,
+    label: 'Planned routine', preview: (value) => previews.push(value), save: async (value) => { saves.push(value); return true; } });
+  const pointer = { pointerId: 1, button: 0, clientY: 100 };
+  handle.fire('pointerdown', pointer);
+  card.fire('pointermove', { ...pointer, clientY: 104 });
+  card.fire('pointerup', { ...pointer, clientY: 104 });
+  assert.deepEqual(saves, []);
+  assert.equal(card.fire('click').defaultPrevented, false);
+  handle.fire('pointerdown', pointer);
+  card.fire('pointermove', { ...pointer, clientY: 100 + 45 * PLANNER_PIXELS_PER_MINUTE });
+  assert.equal(previews.at(-1), 435);
+  const cancel = { key: 'Escape', preventDefault() {}, stopPropagation() {} };
+  documentListeners.keydown(cancel);
+  assert.equal(previews.at(-1), 390);
+  assert.equal(documentListeners.keydown, undefined);
+  assert.deepEqual(saves, []);
+  handle.fire('pointerdown', pointer);
+  card.fire('pointermove', { ...pointer, clientY: 100 + 45 * PLANNER_PIXELS_PER_MINUTE });
+  card.fire('pointercancel', pointer);
+  assert.deepEqual(saves, []);
+  assert.equal(previews.at(-1), 390);
+  handle.fire('pointerdown', pointer);
+  card.fire('pointermove', { ...pointer, clientY: 100 + 45 * PLANNER_PIXELS_PER_MINUTE });
+  card.fire('pointerup', { ...pointer, clientY: 100 + 45 * PLANNER_PIXELS_PER_MINUTE });
+  assert.deepEqual(saves, [435]);
+  assert.equal(card.fire('click').defaultPrevented, true);
+  assert.equal(scroll.scrollTop, 321);
+  handle.fire('keydown', { key: 'ArrowDown' });
+  assert.deepEqual(saves, [435, 450]);
+  assert.equal(handle.attributes['aria-valuenow'], '450');
+  const title = card.createEl('button');
+  card.fire('pointerdown', { ...pointer, target: title });
+  assert.equal(view.cancelDailyMove, null);
+  await Promise.resolve();
+});
+
+test('SIMULATED: moved routine geometry and leaders retain duration and scroll, and marker handles stay independent', async () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const occurrence = T.routineOccurrence(routine({ start: '06:30', end: '06:47' }), day, '13:00');
+  const plugin = dailyPlanPlugin([occurrence.routine]);
+  const view = new PlannerBoardView(null, plugin);
+  view.timeScrollPositions.set(day, 321);
+  view.renderTimedGrid(day, element('div'), [], [], [occurrence]);
+  const grid = view.timedGrids.get(day);
+  const entry = grid.entries[0];
+  const height = entry.element.style.height;
+  const handle = entry.element.querySelector('.iplan-plan-move');
+  handle.fire('keydown', { key: 'ArrowDown' });
+  await plugin._settingsSaveQueue;
+  assert.equal(entry.start, 405);
+  assert.equal(entry.end, 422);
+  assert.equal(entry.element.style.height, height);
+  assert.equal(entry.element.style.top, `${405 * PLANNER_PIXELS_PER_MINUTE}px`);
+  assert.equal(entry.labelLeader.style.top, `${(405 + 8.5) * PLANNER_PIXELS_PER_MINUTE}px`);
+  assert.equal(grid.scroll.scrollTop, 321);
+  assert.equal(occurrence.startMin, 390);
+  assert.equal(occurrence.routine.start, '06:30');
+  assert.equal(plugin.settings._dailyPlanOverrides[day].routines[occurrence.routine.path].end, 422);
+  const [startMarker, endMarker] = grid.workdayLabels;
+  startMarker.element.fire('keydown', { key: 'ArrowDown' });
+  await plugin._settingsSaveQueue;
+  assert.deepEqual(plugin.settings._dailyPlanOverrides[day].workday, { start: 495 });
+  assert.equal(T.workdayFor(day, plugin.settings).end, 1080);
+  endMarker.element.fire('keydown', { key: 'ArrowUp' });
+  await plugin._settingsSaveQueue;
+  assert.deepEqual(plugin.settings._dailyPlanOverrides[day].workday, { start: 495, end: 1065 });
+  assert.deepEqual(T.workdayFor('2026-09-08', plugin.settings), { start: 480, end: 1080 });
+  assert.equal(grid.scroll.scrollTop, 321);
+});
+
+test('SIMULATED: an open routine modal resolves source changes at queue execution and rejects rename or deletion', async () => {
+  for (const change of ['duration', 'renamed', 'deleted']) {
+    const { RoutineDetailModal, element } = routineCardFixture();
+    const plugin = dailyPlanPlugin();
+    plugin.manifest = { id: 'mahdyar-planner' };
+    const day = '2026-09-07';
+    const occurrence = plugin.routinesFor(day)[0];
+    const modal = new RoutineDetailModal(plugin, occurrence, null, element('button'));
+    modal.open();
+    const controls = modal.contentEl.querySelector('.iplan-planned-time-controls');
+    const input = controls.querySelector('input');
+    const save = controls.querySelector('button[aria-label="Set planned start"]');
+    const reset = controls.querySelector('button[aria-label="Reset planned time"]');
+    let began;
+    let release;
+    const started = new Promise((resolve) => { began = resolve; });
+    const gate = new Promise((resolve) => { release = resolve; });
+    let saves = 0;
+    plugin.saveData = async () => { saves += 1; if (saves === 1) { began(); await gate; } };
+    const earlier = plugin.persistSettings();
+    await started;
+    input.value = '07:15';
+    save.fire('click');
+    assert.equal(save.disabled, true);
+    assert.equal(reset.disabled, true);
+    if (change === 'duration') plugin.routines = [routine({ start: '06:30', end: '07:17' })];
+    else {
+      plugin.planFiles.delete(occurrence.routine.path);
+      plugin.routines = change === 'renamed' ? [routine({}, BODY, '02 Planner/Routines/Renamed.md')] : [];
+    }
+    release();
+    await earlier;
+    await plugin._settingsSaveQueue;
+    await Promise.resolve();
+    if (change === 'duration') {
+      assert.deepEqual(plugin.settings._dailyPlanOverrides[day].routines[occurrence.routine.path], { start: 435, end: 482 });
+      assert.equal(modal.contentEl.children.length, 0);
+    } else {
+      assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+      assert.equal(saves, 1);
+      assert.equal(save.disabled, false);
+      assert.equal(reset.disabled, false);
+      assert.ok(modal.contentEl.children.length > 0);
+      reset.fire('click');
+      await plugin._settingsSaveQueue;
+      await Promise.resolve();
+      assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+      assert.equal(saves, 1);
+      modal.close();
+    }
+    assert.equal(occurrence.endMin - occurrence.startMin, 60);
+  }
+});
+
+test('SIMULATED: scrolled workday marker drags track pointer plus scroll with grab offset and cancel cleanly', async () => {
+  for (const mode of ['week', 'day']) {
+    const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE, documentListeners } = routineCardFixture();
+    const plugin = dailyPlanPlugin();
+    const day = '2026-09-07';
+    const view = new PlannerBoardView(null, plugin);
+    view.mode = mode;
+    view.timeScrollPositions.set(day, 321);
+    view.renderTimedGrid(day, element('div'), [], [], []);
+    const grid = view.timedGrids.get(day);
+    const [startMarker, endMarker] = grid.workdayLabels;
+    const initialTotals = T.dailyPlannedTime(day, plugin.settings, [], [], []);
+    const pointer = { pointerId: 3, button: 0, clientY: 137 };
+    startMarker.element.fire('pointerdown', pointer);
+    grid.scroll.scrollTop += 30 * PLANNER_PIXELS_PER_MINUTE;
+    startMarker.element.fire('pointermove', { ...pointer, clientY: 137 + 15 * PLANNER_PIXELS_PER_MINUTE });
+    assert.equal(startMarker.anchor, 525 * PLANNER_PIXELS_PER_MINUTE);
+    assert.equal(startMarker.element.attributes['aria-valuenow'], '525');
+    assert.deepEqual(T.dailyPlannedTime(day, plugin.settings, [], [], []), initialTotals);
+    documentListeners.keydown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+    assert.equal(startMarker.anchor, 480 * PLANNER_PIXELS_PER_MINUTE);
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+    assert.equal(plugin._settingsSaveQueue, undefined);
+    startMarker.element.fire('pointerdown', pointer);
+    grid.scroll.scrollTop += 30 * PLANNER_PIXELS_PER_MINUTE;
+    const moved = { ...pointer, clientY: 137 + 15 * PLANNER_PIXELS_PER_MINUTE };
+    startMarker.element.fire('pointerup', moved);
+    await plugin._settingsSaveQueue;
+    assert.deepEqual(T.workdayFor(day, plugin.settings), { start: 525, end: 1080 });
+    assert.equal(T.dailyPlannedTime(day, plugin.settings, [], [], []).dayMin, 555);
+    assert.equal(endMarker.anchor, 1080 * PLANNER_PIXELS_PER_MINUTE);
+    const committed = JSON.parse(JSON.stringify(plugin.settings._dailyPlanOverrides));
+    endMarker.element.fire('pointerdown', pointer);
+    grid.scroll.scrollTop -= 15 * PLANNER_PIXELS_PER_MINUTE;
+    endMarker.element.fire('pointermove', pointer);
+    assert.equal(endMarker.anchor, 1065 * PLANNER_PIXELS_PER_MINUTE);
+    endMarker.element.fire('pointercancel', pointer);
+    assert.equal(endMarker.anchor, 1080 * PLANNER_PIXELS_PER_MINUTE);
+    assert.deepEqual(plugin.settings._dailyPlanOverrides, committed);
+  }
+});
 
 test('SIMULATED: routine Markdown output is inline and safe, with separate link and checkbox activation', async () => {
   const source = 'Check [Action Items](https://example.com/actions) of today';
@@ -1257,12 +1756,16 @@ test('SIMULATED: details reopen expanded independently, keep step callbacks and 
         view.contentEl.querySelector(selector).fire('click');
         const modal = openedModals.at(-1);
         assert.equal(modal.contentEl.attributes['data-ink-plugin'], 'mahdyar-planner');
-        assert.equal(modal.contentEl.children.length, 3);
-        assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
+        assert.equal(modal.contentEl.children.length, 4);
+        const controls = modal.contentEl.querySelector('.iplan-planned-time-controls');
+        assert.ok(controls.querySelector(`input[aria-label="Planned start for ${occ.routine.name} on ${occ.day}"]`));
+        assert.ok(controls.querySelector('button[aria-label="Set planned start"]'));
+        assert.ok(controls.querySelector('button[aria-label="Reset planned time"]'));
+        assert.equal(modal.contentEl.querySelector('button[aria-label="Close routine details"]'), null);
         assert.equal(modal.contentEl.children[1].textContent, '2026-09-07, 09:00 - 09:15');
         assert.equal(modal.contentEl.querySelector('.iplan-event-modal-title').textContent, occ.routine.name);
         assert.equal(modal.contentEl.querySelector('.iplan-card-title'), null);
-        const card = modal.contentEl.children[2];
+        const card = modal.contentEl.querySelector(`.iplan-routine[data-routine="${occ.routine.path}"]`);
         const toggle = card.children[0].children[0];
         const steps = card.children[1];
         assert.equal(card.children[0].children[1].textContent, T.routineKicker(occ));
@@ -1299,11 +1802,11 @@ test('SIMULATED: overflow dialogs retain each routine name even with only one re
     const modal = new RoutineDetailModal(plugin, occurrences.slice(0, count), null, opener);
     modal.open();
     assert.equal(modal.contentEl.querySelector('.iplan-event-modal-title').textContent, `More routines on ${day}`);
-    for (const [index, occurrence] of occurrences.slice(0, count).entries()) {
-      const card = modal.contentEl.children[2 + index * 2];
+    for (const occurrence of occurrences.slice(0, count)) {
+      const card = modal.contentEl.querySelector(`.iplan-routine[data-routine="${occurrence.routine.path}"]`);
       assert.equal(card.querySelector('.iplan-card-title').textContent, occurrence.routine.name);
       assert.equal(card.querySelector('.iplan-card-sub-toggle').attributes['aria-expanded'], 'true');
-      assert.equal(card.children[2].hidden, false);
+      assert.equal(card.children.find((child) => child.checklist).hidden, false);
     }
   }
 });
@@ -1317,6 +1820,561 @@ test('SIMULATED: Outside is permanent with no prototype state or selector', () =
   assert.equal(view.renderRoutineLabelControl, undefined);
   assert.equal(Object.hasOwn(view.getState(), 'routineLabelMode'), false);
   assert.deepEqual(settings, T.DEFAULT_SETTINGS);
+});
+
+test('SIMULATED: configured workday markers share WEEK and DAY geometry, axis labels and rerendered settings', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const settings = { ...T.DEFAULT_SETTINGS, lunchEnabled: true };
+  const view = new PlannerBoardView(null, { settings });
+  view.wireEvent = () => {};
+  const events = [{ uid: 'busy', day, half: 'am', start: `${day}T08:00:00`, end: `${day}T18:00:00`, title: 'Busy' }];
+  const occ = T.routineOccurrence(routine({ start: '08:15', end: '08:30' }), day, '13:00');
+  let geometry;
+  for (const mode of ['week', 'day']) {
+    view.mode = mode;
+    for (const [dayStart, dayEnd, startMin, endMin] of [
+      ['08:00', '18:00', 480, 1080], ['08:15', '17:45', 495, 1065],
+      ['00:00', '23:59', 0, 1439],
+    ]) {
+      Object.assign(settings, { dayStart, dayEnd });
+      const col = element('div');
+      view.renderTimedGrid(day, col, [], events, [occ]);
+      const grid = view.timedGrids.get(day);
+      const axis = grid.canvas.querySelector('.iplan-time-axis');
+      const labels = axis.children.filter((child) => child.classList.contains('iplan-workday-label'));
+      const lines = grid.slots.children.filter((child) => child.classList.contains('iplan-workday-line'));
+      assert.equal(axis.attributes['aria-hidden'], undefined);
+      assert.equal(labels.length, 2);
+      assert.equal(lines.length, 2);
+      for (const [index, minute] of [startMin, endMin].entries()) {
+        const kind = index === 0 ? 'start' : 'end';
+        const time = index === 0 ? dayStart : dayEnd;
+        assert.deepEqual(Array.from(labels[index].children, (child) => child.textContent), [time]);
+        const title = grid.workdayLabels[index].titleElement;
+        assert.equal(title.parentElement, grid.labelGutter);
+        assert.equal(title.textContent, `Workday ${kind}`);
+        assert.equal(title.attributes.role, 'slider');
+        assert.equal(title.attributes['aria-valuenow'], String(minute));
+        assert.equal(grid.slots.querySelector('.iplan-workday-title'), null);
+        assert.equal(labels[index].attributes['aria-label'], `Planned workday ${kind} on ${day}`);
+        assert.equal(labels[index].attributes.role, 'slider');
+        assert.equal(labels[index].attributes['aria-valuenow'], String(minute));
+        assert.equal(lines[index].style.top, `${minute * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(parseFloat(labels[index].style.top) + parseFloat(labels[index].style['--iplan-workday-anchor']),
+          minute * PLANNER_PIXELS_PER_MINUTE);
+      }
+      for (const hour of axis.children.filter((child) => !child.classList.contains('iplan-workday-label'))) {
+        const top = parseFloat(hour.style.top);
+        const overlaps = labels.some((label) => top + 12 >= parseFloat(label.style.top)
+          && top - 12 <= parseFloat(label.style.top) + 24);
+        assert.equal(hour.hidden, overlaps);
+      }
+      const current = grid.entries.map((entry) => [entry.element.style.top, entry.element.style.height,
+        entry.element.style.left, entry.element.style.width]);
+      if (!geometry) geometry = current;
+      assert.deepEqual(current, geometry);
+      assert.equal(grid.start, 0);
+      assert.equal(grid.end, 1440);
+      assert.equal(grid.canvas.style.height, `${1440 * PLANNER_PIXELS_PER_MINUTE}px`);
+      for (const width of [150, 190, 220]) {
+        grid.canvas.measuredRect = { left: 0, width };
+        grid.labelGutter.measuredRect = { left: width * 0.58, width: width * 0.42 };
+        view.relayoutTimedGrid(day);
+        assert.deepEqual(grid.entries.map((entry) => [entry.element.style.top, entry.element.style.height,
+          entry.element.style.left, entry.element.style.width]), geometry);
+        assert.equal(lines[0].style.top, `${startMin * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(lines[1].style.top, `${endMin * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(grid.labelGutter.querySelector('.iplan-workday-label'), null);
+      }
+      assert.equal(col.querySelector('.iplan-lunch'), null);
+    }
+  }
+});
+
+test('SIMULATED: measured clock and title centers match the painted line after resize without moving time anchors', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  for (const mode of ['week', 'day']) {
+    const view = new PlannerBoardView(null, { settings: T.DEFAULT_SETTINGS });
+    view.mode = mode;
+    view.timeScrollPositions.set(day, 321);
+    view.renderTimedGrid(day, element('div'), [], [], []);
+    const grid = view.timedGrids.get(day);
+    grid.slots.clientTop = 1;
+    for (const [clockHeight, titleHeight, width] of [[10.8, 24, 150], [18, 32, 220], [36, 48, 190]]) {
+      grid.canvas.measuredRect = { left: 0, width };
+      grid.labelGutter.measuredRect = { left: width * 0.58, width: width * 0.42 };
+      for (const marker of grid.workdayLabels) {
+        marker.element.measuredHeight = clockHeight;
+        marker.titleElement.measuredHeight = titleHeight;
+      }
+      for (const relayout of [() => view.relayoutTimedGrid(day), () => view.onResize()]) {
+        relayout();
+        for (const [index, marker] of grid.workdayLabels.entries()) {
+          const line = marker.lineElement.getBoundingClientRect();
+          const paintedCenter = line.top + grid.slots.clientTop + line.height / 2;
+          assert.equal(marker.anchor, (index === 0 ? 480 : 1080) * PLANNER_PIXELS_PER_MINUTE);
+          assert.equal(line.top, marker.anchor);
+          assert.equal(paintedCenter, marker.anchor + 2);
+          for (const label of [marker.element, marker.titleElement]) {
+            const rect = label.getBoundingClientRect();
+            assert.ok(Math.abs(rect.top + rect.height / 2 - paintedCenter) < 0.000001);
+            assert.ok(parseFloat(label.style['--iplan-workday-leader-height']) < 0.000001);
+            assert.equal(rect.top + parseFloat(label.style['--iplan-workday-anchor']) + line.height / 2, paintedCenter);
+          }
+        }
+        assert.equal(grid.scroll.scrollTop, 321);
+      }
+    }
+  }
+});
+
+test('SIMULATED: edge clamping keeps both boxes visible and connectors point to the unchanged blue line', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const view = new PlannerBoardView(null, { settings: { ...T.DEFAULT_SETTINGS,
+    _dailyPlanOverrides: { [day]: { workday: { start: 0, end: 1440 } } } } });
+  view.renderTimedGrid(day, element('div'), [], [], []);
+  const grid = view.timedGrids.get(day);
+  grid.slots.clientTop = 1;
+  for (const measuredHeight of [24, 48]) {
+    for (const marker of grid.workdayLabels) {
+      marker.element.measuredHeight = measuredHeight;
+      marker.titleElement.measuredHeight = measuredHeight;
+    }
+    view.onResize();
+    for (const marker of grid.workdayLabels) {
+      for (const label of [marker.element, marker.titleElement]) {
+        const rect = label.getBoundingClientRect();
+        const center = marker.anchor + 2 - rect.top;
+        assert.ok(rect.top >= 0 && rect.top + rect.height <= 1440 * PLANNER_PIXELS_PER_MINUTE);
+        assert.equal(parseFloat(label.style['--iplan-workday-leader-top']), Math.min(center, rect.height / 2));
+        assert.equal(parseFloat(label.style['--iplan-workday-leader-height']), Math.abs(center - rect.height / 2));
+        assert.equal(rect.top + parseFloat(label.style['--iplan-workday-anchor']) + 1, marker.anchor + 2);
+      }
+      assert.equal(parseFloat(marker.lineElement.style.top), marker.anchor);
+    }
+  }
+});
+
+test('SIMULATED: workday clocks stay HH:mm regardless of generic display format without changing geometry', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const settings = { ...T.DEFAULT_SETTINGS, dayStart: '08:15', dayEnd: '17:45', timeFormat: 'h:mm A' };
+  const view = new PlannerBoardView(null, { settings });
+  T.setDisplayFormatSource(() => T.resolveDisplayFormats(settings, {}));
+  try {
+    for (const format of ['h:mm A', 'HH:mm']) {
+      settings.timeFormat = format;
+      const axis = element('div');
+      const slots = element('div');
+      view.renderTimedWorkdayMarkers('2026-09-07', axis, slots, { start: 0, end: 1440 });
+      assert.deepEqual(axis.children.map((label) => label.textContent), ['08:15', '17:45']);
+      assert.deepEqual(slots.children.map((line) => line.style.top),
+        [`${495 * PLANNER_PIXELS_PER_MINUTE}px`, `${1065 * PLANNER_PIXELS_PER_MINUTE}px`]);
+    }
+  } finally {
+    T.setDisplayFormatSource(null);
+  }
+});
+
+test('SIMULATED: workday titles reserve the shared gutter without routines and follow live defaults, overrides and reset', async () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = dailyPlanPlugin([]);
+  const view = new PlannerBoardView(null, plugin);
+  for (const mode of ['week', 'day']) {
+    view.mode = mode;
+    for (const [start, end] of [[480, 1080], [495, 1065], [0, 1440]]) {
+      await plugin.setDailyPlannedTime(day, null, { start, end });
+      view.renderTimedGrid(day, element('div'), [], [], []);
+      const grid = view.timedGrids.get(day);
+      assert.ok(grid.labelGutter);
+      assert.equal(grid.canvas.classList.contains('has-outside-routine-labels'), true);
+      assert.equal(grid.labelOverflow, null);
+      assert.equal(grid.labelGutter.children.length, 2);
+      for (const [index, minute] of [start, end].entries()) {
+        const marker = grid.workdayLabels[index];
+        const clock = `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
+        assert.equal(marker.element.textContent, clock);
+        assert.equal(marker.titleElement.textContent, index === 0 ? 'Workday start' : 'Workday end');
+        assert.equal(marker.anchor, minute * PLANNER_PIXELS_PER_MINUTE);
+        assert.equal(grid.slots.children[index].style.top, `${marker.anchor}px`);
+      }
+      assert.deepEqual(T.workdayFor('2026-09-08', plugin.settings), { start: 480, end: 1080 });
+    }
+    await plugin.setDailyPlannedTime(day, null, null);
+    Object.assign(plugin.settings, { dayStart: '09:00', dayEnd: '19:00' });
+    view.renderTimedGrid(day, element('div'), [], [], []);
+    assert.deepEqual(Array.from(view.timedGrids.get(day).workdayLabels, (marker) => marker.element.textContent), ['09:00', '19:00']);
+    Object.assign(plugin.settings, { dayStart: '08:00', dayEnd: '18:00' });
+  }
+});
+
+test('SIMULATED: close boundary titles and routine labels never overlap in the shared gutter at narrow widths or day edges', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  for (const mode of ['week', 'day']) {
+    for (const start of [0, 495, 1439]) {
+      const settings = { ...T.DEFAULT_SETTINGS, _dailyPlanOverrides: { [day]: { workday: { start, end: start + 1 } } } };
+      const view = new PlannerBoardView(null, { settings });
+      view.mode = mode;
+      const occurrence = { ...T.routineOccurrence(routine(), day, '13:00'), startMin: start, endMin: start + 1 };
+      view.renderTimedGrid(day, element('div'), [], [], [occurrence]);
+      const grid = view.timedGrids.get(day);
+      const entry = grid.entries[0];
+      for (const width of [150, 190, 220]) {
+        grid.canvas.measuredRect = { left: 0, width };
+        grid.labelGutter.measuredRect = { left: width * 0.58, width: width * 0.42 };
+        view.relayoutTimedGrid(day);
+        const [first, second] = grid.workdayLabels;
+        assert.ok(first.titleTop >= 0);
+        assert.ok(first.titleBottom <= second.titleTop);
+        assert.ok(second.titleBottom <= 1440 * PLANNER_PIXELS_PER_MINUTE);
+        assert.equal(entry.labelElement.hidden, false);
+        const top = parseFloat(entry.labelElement.style.top);
+        const bottom = top + entry.labelElement.getBoundingClientRect().height;
+        assert.ok(top >= 0 && bottom <= 1440 * PLANNER_PIXELS_PER_MINUTE);
+        for (const marker of grid.workdayLabels) {
+          assert.equal(marker.titleElement.parentElement, entry.labelElement.parentElement);
+          assert.ok(bottom <= marker.titleTop || top >= marker.titleBottom);
+          assert.equal(marker.titleTop + parseFloat(marker.titleElement.style['--iplan-workday-anchor']), marker.anchor);
+        }
+        assert.equal(grid.slots.children[0].style.top, `${start * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(grid.slots.children[1].style.top, `${(start + 1) * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(entry.element.style.top, `${start * PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(entry.element.style.height, `${PLANNER_PIXELS_PER_MINUTE}px`);
+        assert.equal(entry.labelLeader.style.top, `${(start + 0.5) * PLANNER_PIXELS_PER_MINUTE}px`);
+      }
+    }
+  }
+});
+
+test('SIMULATED: gutter titles share clock drag, cancellation, keyboard values and focus without changing capacity during preview', async () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE, documentListeners } = routineCardFixture();
+  const day = '2026-09-07';
+  const plugin = dailyPlanPlugin([]);
+  const view = new PlannerBoardView(null, plugin);
+  view.timeScrollPositions.set(day, 321);
+  view.renderTimedGrid(day, element('div'), [], [], []);
+  const grid = view.timedGrids.get(day);
+  const [start, end] = grid.workdayLabels;
+  const pointer = { pointerId: 8, button: 0, clientY: 123 };
+  start.titleElement.fire('pointerdown', pointer);
+  grid.scroll.scrollTop += 15 * PLANNER_PIXELS_PER_MINUTE;
+  start.element.fire('pointermove', { ...pointer, clientY: 123 + 15 * PLANNER_PIXELS_PER_MINUTE });
+  assert.equal(start.element.textContent, '08:30');
+  assert.equal(start.titleElement.attributes['aria-valuenow'], '510');
+  assert.equal(start.element.attributes['aria-valuenow'], '510');
+  assert.equal(T.dailyPlannedTime(day, plugin.settings, [], [], []).dayMin, 600);
+  documentListeners.keydown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+  assert.equal(start.element.textContent, '08:00');
+  assert.equal(start.titleElement.attributes['aria-valuenow'], '480');
+  assert.deepEqual(plugin.settings._dailyPlanOverrides, {});
+  start.titleElement.fire('pointerdown', pointer);
+  start.element.fire('pointerup', { ...pointer, clientY: 123 + 15 * PLANNER_PIXELS_PER_MINUTE });
+  await plugin._settingsSaveQueue;
+  assert.deepEqual(T.workdayFor(day, plugin.settings), { start: 495, end: 1080 });
+  assert.equal(view.pendingPlanFocus, `workday-title:${day}:start`);
+  end.titleElement.fire('keydown', { key: 'ArrowUp' });
+  await plugin._settingsSaveQueue;
+  assert.equal(end.element.textContent, '17:45');
+  assert.equal(end.titleElement.attributes['aria-valuenow'], '1065');
+  assert.equal(view.pendingPlanFocus, `workday-title:${day}:end`);
+  end.titleElement.fire('keydown', { key: 'End' });
+  await plugin._settingsSaveQueue;
+  assert.equal(end.element.textContent, '24:00');
+  assert.equal(end.titleElement.attributes['aria-valuenow'], '1440');
+  for (const [key, expected] of [['Home', 0], ['End', 1065]]) {
+    start.titleElement.fire('keydown', { key });
+    await plugin._settingsSaveQueue;
+    assert.equal(start.titleElement.attributes['aria-valuenow'], String(expected));
+    assert.equal(start.element.attributes['aria-valuenow'], String(expected));
+  }
+  assert.equal(grid.scroll.scrollTop, 321 + 15 * PLANNER_PIXELS_PER_MINUTE);
+});
+
+test('SIMULATED: first visible scroll waits for title measurement and saved scroll still wins', () => {
+  const { PlannerBoardView, element } = routineCardFixture(undefined, { ignoreHiddenScrollAssignments: true });
+  const day = '2026-09-07';
+  const view = new PlannerBoardView(null, { settings: { ...T.DEFAULT_SETTINGS, dayStart: '23:58', dayEnd: '23:59' } });
+  const col = element('div');
+  col.hidden = true;
+  view.renderTimedGrid(day, col, [], [], []);
+  const grid = view.timedGrids.get(day);
+  col.hidden = false;
+  for (const marker of grid.workdayLabels) marker.titleElement.measuredHeight = 0;
+  view.onResize();
+  assert.equal(grid.initialScrollPending, true);
+  for (const marker of grid.workdayLabels) marker.titleElement.measuredHeight = 48;
+  view.onResize();
+  assert.equal(grid.initialScrollPending, false);
+  const first = grid.workdayLabels[0];
+  assert.equal(grid.scroll.scrollTop, Math.min(first.top, first.titleTop));
+  for (const marker of grid.workdayLabels) {
+    assert.ok(marker.titleTop >= grid.scroll.scrollTop);
+    assert.ok(marker.titleBottom <= grid.scroll.scrollTop + 96);
+  }
+  grid.scroll.scrollTop = 0;
+  grid.scroll.fire('scroll');
+  view.renderTimedGrid(day, element('div'), [], [], []);
+  view.onResize();
+  assert.equal(view.timedGrids.get(day).scroll.scrollTop, 0);
+});
+
+test('SIMULATED: close workday labels stay separated inside day edges while time anchors stay exact', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const height = 1440 * PLANNER_PIXELS_PER_MINUTE;
+  for (const [dayStart, dayEnd] of [['00:00', '00:01'], ['08:15', '08:16'], ['23:58', '23:59']]) {
+    for (const labelHeight of [36, 72]) {
+      const view = new PlannerBoardView(null, { settings: { dayStart, dayEnd } });
+      const axis = element('div');
+      const createEl = axis.createEl;
+      axis.createEl = (tag, options) => {
+        const label = createEl(tag, options);
+        label.measuredHeight = labelHeight;
+        return label;
+      };
+      const slots = element('div');
+      const labels = view.renderTimedWorkdayMarkers('2026-09-07', axis, slots, { start: 0, end: 1440 });
+      assert.equal(labels.length, 2);
+      assert.ok(labels[0].top >= 0);
+      assert.ok(labels[0].bottom <= labels[1].top);
+      assert.ok(labels[1].bottom <= height);
+      for (const [index, time] of [dayStart, dayEnd].entries()) {
+        const anchor = T.hmToMin(time) * PLANNER_PIXELS_PER_MINUTE;
+        assert.equal(parseFloat(slots.children[index].style.top), anchor);
+        assert.equal(labels[index].top + parseFloat(labels[index].element.style['--iplan-workday-anchor']), anchor);
+      }
+      const fixture = routineCardFixture(undefined, { workdayLabelHeight: labelHeight });
+      const viewportView = new fixture.PlannerBoardView(null, { settings: { dayStart, dayEnd } });
+      const day = '2026-09-07';
+      viewportView.renderTimedGrid(day, fixture.element('div'), [], [], []);
+      const grid = viewportView.timedGrids.get(day);
+      grid.scroll.clientHeight = labelHeight * 2;
+      assert.ok(grid.scroll.scrollTop <= grid.workdayLabels[0].top);
+      for (const label of grid.workdayLabels) {
+        assert.ok(label.top >= grid.scroll.scrollTop);
+        assert.ok(label.bottom <= grid.scroll.scrollTop + grid.scroll.clientHeight);
+      }
+      assert.equal(grid.initialScrollPending, false);
+      for (const saved of [0, 321]) {
+        grid.scroll.scrollTop = saved;
+        grid.scroll.fire('scroll');
+        viewportView.renderTimedGrid(day, fixture.element('div'), [], [], []);
+        const rerendered = viewportView.timedGrids.get(day);
+        assert.equal(rerendered.scroll.scrollTop, saved);
+        viewportView.onResize();
+        assert.equal(rerendered.scroll.scrollTop, saved);
+        assert.equal(viewportView.timeScrollPositions.get(day), saved);
+      }
+    }
+  }
+  for (const dayEnd of ['08:00', '07:00']) {
+    const view = new PlannerBoardView(null, { settings: { dayStart: '08:00', dayEnd } });
+    assert.equal(view.renderTimedWorkdayMarkers('2026-09-07', element('div'), element('div'),
+      { start: 0, end: 1440 }).length, 0);
+  }
+});
+
+test('SIMULATED: visible relayout remeasures workday and hourly labels without duplicating nodes or moving geometry and user scroll', () => {
+  const { PlannerBoardView, element, PLANNER_PIXELS_PER_MINUTE } = routineCardFixture();
+  const day = '2026-09-07';
+  for (const mode of ['week', 'day']) {
+    const view = new PlannerBoardView(null, { settings: { ...T.DEFAULT_SETTINGS, dayStart: '08:15', dayEnd: '08:16' } });
+    view.mode = mode;
+    view.wireEvent = () => {};
+    const col = element('div');
+    col.hidden = true;
+    const occ = T.routineOccurrence(routine({ start: '09:00', end: '09:15' }), day, '13:00');
+    const events = [{ uid: 'busy', day, half: 'am', start: `${day}T09:00:00`, end: `${day}T10:00:00`, title: 'Busy' }];
+    view.renderTimedGrid(day, col, [], events, [occ]);
+    const grid = view.timedGrids.get(day);
+    const axis = grid.canvas.querySelector('.iplan-time-axis');
+    const axisNodes = [...axis.children];
+    const slotNodes = [...grid.slots.children];
+    const geometry = grid.entries.map((entry) => ({ ...entry.element.style }));
+    const canvasHeight = grid.canvas.style.height;
+    const slotsHeight = grid.slots.style.height;
+    assert.equal(grid.initialScrollPending, true);
+    assert.ok(grid.workdayLabels.every((label) => label.height === 0));
+    for (const label of grid.workdayLabels) label.element.measuredHeight = 72;
+    view.onResize();
+    assert.equal(grid.initialScrollPending, true);
+    col.hidden = false;
+    view.onResize();
+    assert.equal(grid.initialScrollPending, false);
+    assert.equal(grid.scroll.scrollTop, grid.workdayLabels[0].top);
+    assert.ok(grid.workdayLabels[1].bottom <= grid.scroll.scrollTop + 144);
+    const hourEight = grid.hourLabels.find((hour) => hour.top === 480 * PLANNER_PIXELS_PER_MINUTE);
+    const suppression = [];
+    for (const [labelHeight, hourHeight, width, saved] of [
+      [120 * PLANNER_PIXELS_PER_MINUTE, 30 * PLANNER_PIXELS_PER_MINUTE, 150, 0],
+      [2 * PLANNER_PIXELS_PER_MINUTE, 2 * PLANNER_PIXELS_PER_MINUTE, 220, 321],
+      [60 * PLANNER_PIXELS_PER_MINUTE, 12 * PLANNER_PIXELS_PER_MINUTE, 190, 0],
+    ]) {
+      grid.scroll.scrollTop = saved;
+      grid.scroll.fire('scroll');
+      for (const label of grid.workdayLabels) label.element.measuredHeight = labelHeight;
+      for (const hour of grid.hourLabels) hour.element.measuredHeight = hourHeight;
+      grid.canvas.measuredRect = { left: 0, width };
+      grid.labelGutter.measuredRect = { left: width * 0.58, width: width * 0.42 };
+      for (const relayout of [() => view.relayoutTimedGrid(day), () => view.onResize()]) {
+        relayout();
+        const [start, end] = grid.workdayLabels;
+        assert.equal(start.height, labelHeight);
+        assert.equal(end.height, labelHeight);
+        assert.ok(start.bottom <= end.top);
+        for (const [index, label] of grid.workdayLabels.entries()) {
+          const anchor = (index === 0 ? 495 : 496) * PLANNER_PIXELS_PER_MINUTE;
+          assert.equal(label.top + parseFloat(label.element.style['--iplan-workday-anchor']), anchor);
+          assert.equal(slotNodes[index].style.top, `${anchor}px`);
+        }
+        for (const hour of grid.hourLabels) {
+          const overlaps = grid.workdayLabels.some((label) => hour.top + hourHeight / 2 >= label.top
+            && hour.top - hourHeight / 2 <= label.bottom);
+          assert.equal(hour.element.hidden, overlaps);
+        }
+        assert.deepEqual(axis.children, axisNodes);
+        assert.deepEqual(grid.slots.children, slotNodes);
+        assert.deepEqual(grid.entries.map((entry) => ({ ...entry.element.style })), geometry);
+        assert.equal(grid.canvas.style.height, canvasHeight);
+        assert.equal(grid.slots.style.height, slotsHeight);
+        assert.equal(grid.scroll.scrollTop, saved);
+        assert.equal(view.timeScrollPositions.get(day), saved);
+      }
+      suppression.push(hourEight.element.hidden);
+    }
+    assert.deepEqual(suppression, [true, false, true]);
+  }
+});
+
+test('SIMULATED: hidden panes defer saved scroll restoration, including zero, until visible relayout', () => {
+  const { PlannerBoardView, element } = routineCardFixture(undefined, { ignoreHiddenScrollAssignments: true });
+  const day = '2026-09-07';
+  for (const mode of ['week', 'day']) {
+    for (const saved of [321, 0]) {
+      const view = new PlannerBoardView(null, { settings: T.DEFAULT_SETTINGS });
+      view.mode = mode;
+      view.timeScrollPositions.set(day, saved);
+      const col = element('div');
+      col.hidden = true;
+      view.renderTimedGrid(day, col, [], [], []);
+      const grid = view.timedGrids.get(day);
+      grid.scroll.scrollTop = 999;
+      assert.equal(grid.scroll.scrollTop, 0);
+      assert.equal(grid.initialScrollPending, false);
+      assert.equal(grid.pendingSavedScrollTop, saved);
+      grid.scroll.fire('scroll');
+      view.onResize();
+      assert.equal(grid.pendingSavedScrollTop, saved);
+      assert.equal(view.timeScrollPositions.get(day), saved);
+      col.hidden = false;
+      grid.scroll.fire('scroll');
+      assert.equal(grid.pendingSavedScrollTop, saved);
+      grid.scroll.measuredHeight = 0;
+      view.onResize();
+      assert.equal(grid.pendingSavedScrollTop, saved);
+      grid.scroll.measuredHeight = 144;
+      view.onResize();
+      assert.equal(grid.scroll.scrollTop, saved);
+      assert.equal(grid.pendingSavedScrollTop, null);
+      grid.scroll.fire('scroll');
+      view.onResize();
+      assert.equal(grid.scroll.scrollTop, saved);
+      assert.equal(view.timeScrollPositions.get(day), saved);
+    }
+  }
+});
+
+test('SIMULATED: meaningful user scroll supersedes pending saved or fresh initial scroll', () => {
+  const { PlannerBoardView, element } = routineCardFixture(undefined, { ignoreHiddenScrollAssignments: true });
+  const day = '2026-09-07';
+  for (const saved of [undefined, 0, 321]) {
+    const view = new PlannerBoardView(null, { settings: T.DEFAULT_SETTINGS });
+    if (saved !== undefined) view.timeScrollPositions.set(day, saved);
+    const col = element('div');
+    col.hidden = true;
+    view.renderTimedGrid(day, col, [], [], []);
+    const grid = view.timedGrids.get(day);
+    grid.scroll.fire('scroll');
+    assert.equal(grid.initialScrollPending, saved === undefined);
+    col.hidden = false;
+    grid.scroll.fire('scroll');
+    assert.equal(grid.initialScrollPending, saved === undefined);
+    grid.scroll.scrollTop = 123;
+    grid.scroll.fire('scroll');
+    assert.equal(grid.pendingSavedScrollTop, null);
+    assert.equal(grid.initialScrollPending, false);
+    view.onResize();
+    assert.equal(grid.scroll.scrollTop, 123);
+    assert.equal(view.timeScrollPositions.get(day), 123);
+    grid.scroll.scrollTop = 0;
+    grid.scroll.fire('scroll');
+    view.onResize();
+    assert.equal(grid.scroll.scrollTop, 0);
+    assert.equal(view.timeScrollPositions.get(day), 0);
+    view.renderTimedGrid(day, element('div'), [], [], []);
+    assert.equal(view.timedGrids.get(day).scroll.scrollTop, 0);
+  }
+});
+
+test('SOURCE: workday clocks and gutter titles use theme blue and solid pointer-transparent lines', () => {
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  const labelRule = css.match(/\.iplan-workday-label\s*\{([^}]+)\}/)[1];
+  assert.match(labelRule, /width:\s*38px/);
+  assert.match(labelRule, /transform:\s*none/);
+  assert.match(labelRule, /color:\s*var\(--color-blue\)/);
+  assert.match(labelRule, /background:\s*var\(--iplan-surface\)/);
+  assert.match(labelRule, /overflow-wrap:\s*normal/);
+  assert.match(css, /button\.iplan-workday-label\s*\{[^}]*white-space:\s*nowrap/);
+  const clockRule = css.match(/button\.iplan-workday-label\s*\{([^}]+)\}/)[1];
+  assert.match(clockRule, /appearance:\s*none/);
+  assert.match(clockRule, /padding:\s*0/);
+  assert.match(clockRule, /border:\s*0/);
+  assert.match(clockRule, /min-height:\s*0/);
+  for (const rule of [clockRule, css.match(/button\.iplan-workday-title\s*\{([^}]+)\}/)[1]]) {
+    assert.match(rule, /display:\s*flex/);
+    assert.match(rule, /align-items:\s*center/);
+    assert.doesNotMatch(rule, /transform:\s*translateY/);
+  }
+  assert.match(css, /button\.iplan-workday-title::after\s*\{[^}]*height:\s*var\(--iplan-workday-leader-height\)/);
+  const lineRule = css.match(/\.iplan-workday-line\s*\{([^}]+)\}/)[1];
+  assert.match(lineRule, /border-top:\s*2px solid var\(--color-blue\)/);
+  assert.match(lineRule, /z-index:\s*4/);
+  assert.match(lineRule, /pointer-events:\s*none/);
+  assert.doesNotMatch(css, /\.iplan-workday[^{}]*\{[^}]*dashed/);
+  assert.match(css, /button\.iplan-workday-title\s*\{[^}]*white-space:\s*nowrap/);
+  assert.match(css, /button\.iplan-workday-title\s*\{[^}]*color:\s*var\(--color-blue\)/);
+  assert.match(css, /button\.iplan-workday-title\s*\{[^}]*pointer-events:\s*auto/);
+  assert.match(css, /\.iplan-time-canvas\.has-outside-routine-labels\s*\{[^}]*min-width:\s*calc\(/);
+  assert.match(css, /\.iplan-time-label\[hidden\]\s*\{\s*display:\s*none !important/);
+  assert.match(css, /\.iplan-time-slots\s*\{[^}]*inset:\s*0 0 0 42px/);
+  assert.match(css, /\.has-outside-routine-labels \.iplan-time-slots\s*\{\s*right:\s*var\(--iplan-routine-gutter\)/);
+  const main = fs.readFileSync(T.__mainPath, 'utf8');
+  const board = main.slice(main.indexOf('class PlannerBoardView extends ItemView'), main.indexOf('const TRAY_TABS'));
+  assert.ok(board.includes('this.renderTimedWorkdayMarkers(day, axis, slots, bounds, scroll, labelGutter)'));
+  assert.ok(board.includes('const hasGutter = outside || workday.end > workday.start;'));
+  assert.ok(board.includes('const bounds = timedGridBounds(0, 1440, entries)'));
+  assert.match(board, /if \(isCalendar\)\s*\{[^}]*this\.renderTimedGrid\(day, col, items, events, routines\)/);
+  const markers = board.slice(board.indexOf('  renderTimedWorkdayMarkers('), board.indexOf('  relayoutTimedGrid('));
+  assert.match(markers, /workdayFor\(day, this\.plugin\.settings\)/);
+  assert.match(markers, /plannedStartText\(/);
+  assert.doesNotMatch(markers, /fmtTimeHM\(/);
+  assert.doesNotMatch(markers, /lunch|splitTime|countdown|saveSettings|assignTimedItem/);
+});
+
+test('SOURCE: timed routines alone have a solid vivid green left border inside their unchanged border box', () => {
+  const css = fs.readFileSync(path.join(path.dirname(T.__mainPath), 'styles.css'), 'utf8');
+  const rule = css.match(/\.iplan-root \.iplan-card\.iplan-time-routine\s*\{([^}]*border-left[^}]+)\}/)[1];
+  assert.match(rule, /border-left:\s*2px solid var\(--color-green, var\(--iplan-success\)\)/);
+  assert.match(rule, /box-sizing:\s*border-box/);
+  assert.doesNotMatch(rule, /(?:^|;)\s*(?:background|height|width|margin|padding|box-shadow)\s*:/);
+  const accentRules = css.match(/[^{}]+\{[^{}]*border-left:\s*2px solid var\(--color-green, var\(--iplan-success\)\)[^{}]*\}/g);
+  assert.equal(accentRules.length, 1);
+  assert.match(accentRules[0], /^\s*\.iplan-root \.iplan-card\.iplan-time-routine\s*\{/);
+  assert.match(css, /\.iplan-card\.iplan-routine\s*\{[^}]*border-left:\s*2px solid var\(--iplan-hairline\)/);
+  assert.match(css, /\.iplan-root \.iplan-time-routine:focus-visible,[\s\S]*?outline:\s*1px solid var\(--iplan-marker\)/);
 });
 
 test('SIMULATED: permanent Outside keeps exact routine geometry, event slots and daily totals in WEEK and DAY', () => {
@@ -1604,24 +2662,33 @@ test('SIMULATED: overflow opens every hidden routine with details and restores o
   const modal = openedModals.at(-1);
   assert.deepEqual(Array.from(modal.occurrences), Array.from(grid.hiddenRoutineEntries, (entry) => entry.occ));
   assert.match(modal.contentEl.children[0].textContent, /More routines on 2026-09-07/);
-  for (const [index, occurrence] of modal.occurrences.entries()) {
-    const card = modal.contentEl.children[2 + index * 2];
-    assert.equal(card.children[1].textContent, occurrence.routine.name);
-    assert.equal(card.children[2].checklist.model.rows.length, 3);
-    assert.equal(card.children[2].hidden, false);
-    assert.equal(card.children[0].children[0].attributes['aria-expanded'], 'true');
-    card.children[0].children[0].fire('click');
-    assert.equal(card.children[2].hidden, true);
+  for (const occurrence of modal.occurrences) {
+    const card = modal.contentEl.querySelector(`.iplan-routine[data-routine="${occurrence.routine.path}"]`);
+    assert.equal(card.querySelector('.iplan-card-title').textContent, occurrence.routine.name);
+    const steps = card.children.find((child) => child.checklist);
+    const toggle = card.querySelector('.iplan-card-sub-toggle');
+    assert.equal(steps.checklist.model.rows.length, 3);
+    assert.equal(steps.hidden, false);
+    assert.equal(toggle.attributes['aria-expanded'], 'true');
+    assert.equal(toggle.focused, occurrence === modal.occurrences[0] ? true : undefined);
+    const input = modal.contentEl.querySelector(`input[aria-label="Planned start for ${occurrence.routine.name} on ${occurrence.day}"]`);
+    assert.ok(input);
+    assert.ok(input.parentElement.querySelector('button[aria-label="Set planned start"]'));
+    assert.ok(input.parentElement.querySelector('button[aria-label="Reset planned time"]'));
+    toggle.fire('click');
+    assert.equal(steps.hidden, true);
+    assert.equal(toggle.attributes['aria-expanded'], 'false');
   }
   assert.equal(view.routineExpanded.size, 0);
-  assert.equal(modal.contentEl.children.length, 1 + 2 * modal.occurrences.length);
-  assert.equal(modal.contentEl.querySelector('.iplan-nav-btn'), null);
+  assert.equal(modal.contentEl.querySelector('button[aria-label="Close routine details"]'), null);
   modal.close();
   assert.equal(view.contentEl.querySelector('.iplan-routine-label-overflow').focused, true);
   view.contentEl.querySelector('.iplan-routine-label-overflow').fire('click');
   const reopened = openedModals.at(-1);
-  for (const index of reopened.occurrences.keys()) {
-    assert.equal(reopened.contentEl.children[2 + index * 2].children[2].hidden, false);
+  for (const occurrence of reopened.occurrences) {
+    const card = reopened.contentEl.querySelector(`.iplan-routine[data-routine="${occurrence.routine.path}"]`);
+    assert.equal(card.children.find((child) => child.checklist).hidden, false);
+    assert.equal(card.querySelector('.iplan-card-sub-toggle').attributes['aria-expanded'], 'true');
   }
   reopened.close();
 });
