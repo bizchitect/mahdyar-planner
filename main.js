@@ -3628,7 +3628,8 @@ async function emailProbeGone(settings, item, deps) {
  * Connector: Google Calendar via secret ICS URL (read-only, no OAuth).
  * Minimal RFC 5545 parser + best-effort RRULE expansion for the visible week:
  * FREQ=DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, BYDAY (weekly, and
- * monthly with an optional ordinal such as 3SU or -1FR), UNTIL,
+ * monthly with an optional ordinal such as 3SU or -1FR), BYSETPOS (monthly
+ * with BYDAY), UNTIL,
  * COUNT, EXDATE and RECURRENCE-ID overrides. Exotic rules degrade to "shows
  * the master occurrence only", never to a crash.
  * ========================================================================== */
@@ -3855,8 +3856,17 @@ function expandOccurrences(def, winStart, winEnd) {
           // A fifth weekday the month does not have picks nothing: the month is skipped.
           for (const day of n ? [all[+n > 0 ? +n - 1 : all.length + +n]] : all) if (day != null) days.add(day);
         }
+        let monthDays = [...days].sort((a, b) => a - b);
+        // BYSETPOS keeps only the named positions of the month's set (1 is the
+        // first, -1 the last), before the start filter; out of range picks nothing.
+        if (def.rrule.BYSETPOS) {
+          const set = monthDays;
+          monthDays = [...new Set(def.rrule.BYSETPOS.split(',').map((p) => +p.trim())
+            .map((p) => set[p > 0 ? p - 1 : set.length + p]).filter((x) => x != null))]
+            .sort((a, b) => a - b);
+        }
         let stop = false;
-        for (const day of [...days].sort((a, b) => a - b)) {
+        for (const day of monthDays) {
           const occ = new Date(d);
           occ.setDate(day);
           if (occ < startInstant) continue;
