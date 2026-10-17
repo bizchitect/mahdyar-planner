@@ -6,6 +6,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 Releases before 0.12.0 carry their notes on the GitHub release itself
 (the commit subjects since the previous tag).
 
+## [1.1.0] - 2026-10-17
+
+### Added
+- Todoist task durations sync into task notes and determine the exact block
+  length when tasks are placed on the planner. Existing notes gain their
+  source duration on the next sync when no local duration is set.
+- Unscheduled, source-owned estimates follow Todoist duration changes and
+  removal without overwriting locally edited or scheduled durations.
+
+### Fixed
+- Moving a timed task preserves its existing duration across task providers.
+- A placement that would cross midnight is rejected with a notice instead of
+  silently shortening the task.
+
 ## [0.16.2] - 2026-09-26
 
 ### Fixed
