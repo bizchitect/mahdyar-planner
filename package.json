@@ -1,6 +1,6 @@
 {
   "name": "icor-for-life-planner",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "description": "Headless gates for the ICOR for Life - Planner plugin. main.js has no build step; this exists only so `npm test` has somewhere to live.",
   "scripts": {

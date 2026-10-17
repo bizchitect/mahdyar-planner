@@ -1193,8 +1193,8 @@ function plannedStartMinute(value) {
 }
 
 function plannedDuration(value) {
-  return Number.isInteger(value) && value >= PLANNER_SLOT_MINUTES && value % PLANNER_SLOT_MINUTES === 0
-    ? value : null;
+  // Starts still snap to the grid; durations can be exact source minutes.
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
 function validPlannerDay(value) {
@@ -1229,9 +1229,9 @@ function snapPlannerMinute(value) {
 }
 
 function clampPlannedDuration(start, value) {
-  const max = Math.floor((1440 - start) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES;
+  const max = 1440 - start;
   const requested = plannedDuration(value) || PLANNER_DEFAULT_DURATION;
-  return Math.min(max, Math.max(PLANNER_SLOT_MINUTES, requested));
+  return Math.min(max, requested);
 }
 
 function plannedStartText(minute) {
@@ -1975,6 +1975,30 @@ function todoistPriorityRank(apiPriority) {
   return clampPriorityRank(5 - apiPriority);
 }
 
+// Todoist duration units are minutes or days, not hours. Unknown/invalid
+// values behave like no estimate; never guess a unit or round to grid slots.
+function todoistDurationMinutes(duration) {
+  if (!duration || !Number.isSafeInteger(duration.amount) || duration.amount <= 0) return null;
+  const scale = duration.unit === 'minute' ? 1 : (duration.unit === 'day' ? 1440 : null);
+  return scale == null ? null : plannedDuration(duration.amount * scale);
+}
+
+// Only an unscheduled, still source-owned estimate follows source changes.
+// An older note with no duration is backfilled on its very next sync.
+// The existing sync shadow holds the last source estimate, never a setting
+// or a two-way field. Missing baseline plus any local value means hands off.
+function todoistDurationPlan(prior, t, shadow) {
+  if (prior.source !== 'todoist') return null;
+  const duration = plannedDuration(t.duration);
+  const hasBaseline = !!shadow && Object.prototype.hasOwnProperty.call(shadow, 'duration');
+  // Once handed to the plan, do not reclaim ownership if a later source
+  // estimate happens to equal the person's duration (or they clear it).
+  const owned = !(shadow && shadow.durationOwned === false)
+    && !prior.plannedDay && !prior.plannedStart && !prior.plannedOccurrenceDue
+    && (hasBaseline ? prior.plannedDuration === shadow.duration : prior.plannedDuration == null);
+  return { duration, owned, changed: owned && prior.plannedDuration !== duration };
+}
+
 async function todoistFetchOpen(settings, deps) {
   const token = (settings.todoistToken || '').trim();
   if (!token) return degraded('todoist', 'no-token', 'Todoist is not connected (no token).');
@@ -2004,6 +2028,7 @@ async function todoistFetchOpen(settings, deps) {
           description: (t.description || '').replace(/\s+$/, ''),
           due: t.due && t.due.date ? String(t.due.date).slice(0, 10) : null,
           priority: todoistPriorityRank(t.priority),
+          duration: todoistDurationMinutes(t.duration),
           // Planner task links always open in the Todoist desktop app.
           url: `todoist://task?id=${encodeURIComponent(String(t.id))}`,
           tags: Array.isArray(t.labels) ? t.labels : [],
@@ -4695,12 +4720,15 @@ function plannerToolbarMountPoint(root) {
  *   status: open|done         - SOURCE truth, written by reconcile
  *   planned_day / planned_half / planned_order - legacy placement coordinates
  *   planned_start / planned_duration / planned_occurrence_due - local timed placement
+ *   Unscheduled Todoist planned_duration can follow its source estimate until
+ *   locally edited; scheduled durations always remain plan-owned.
  *   done_local / weekly_goal  - planner-local flags (never written to source)
  *   linked_note               - plan-owned: the note this task is FOR
  * The AI team edits the same fields to move items; the board re-renders live.
  *
  * PLAN-OWNED FIELDS (PLAN_OWNED_ITEM_FIELDS) are the planner's own half of
- * the note. A sync run pulls what the source owns and never touches these:
+ * the note. Apart from untouched, unscheduled Todoist duration estimates,
+ * a sync run pulls what the source owns and never touches these:
  * updateItemFile goes through processFrontMatter and assigns by name, so a
  * field it does not name survives every pull by construction. That is a
  * property worth a test rather than a comment, and vault-writes.test.cjs
@@ -4715,7 +4743,7 @@ function plannerToolbarMountPoint(root) {
  * ========================================================================== */
 
 // The fields the planner owns on an item note. Sync pulls the rest and leaves
-// every one of these alone.
+// every one of these alone, except a source-owned, unscheduled Todoist estimate.
 const PLAN_OWNED_ITEM_FIELDS = [
   'planned_day', 'planned_half', 'planned_order', 'planned_start', 'planned_duration',
   'planned_occurrence_due', 'done_local', 'weekly_goal', 'linked_note',
@@ -8108,8 +8136,12 @@ class IcorPlannerPlugin extends Plugin {
       // the probe compares against is never older than the last sync.
       if (uidValidity) nextShadow.uidvalidity = uidValidity;
       if (t.messageId) nextShadow.messageId = t.messageId;
+      const durationOwned = await this.updateItemFile(prior, t, finals, body, plan, shadow);
+      if (source === 'todoist') {
+        nextShadow.duration = plannedDuration(t.duration);
+        nextShadow.durationOwned = durationOwned;
+      }
       s._shadow[key] = nextShadow;
-      await this.updateItemFile(prior, t, finals, body, plan);
       if (plan.resetChildrenDoneLocal) advancedParents.push(key);
     }
     // A recurring parent moved on: the new occurrence starts with its
@@ -8585,6 +8617,8 @@ class IcorPlannerPlugin extends Plugin {
       'planned_day: null',
       'planned_half: null',
       'planned_order: 0',
+      ...(source === 'todoist' && plannedDuration(t.duration) != null
+        ? [`planned_duration: ${t.duration}`] : []),
       'weekly_goal: false',
       'done_local: false',
       'linked_note: null',
@@ -8597,6 +8631,7 @@ class IcorPlannerPlugin extends Plugin {
       const created = await this.app.vault.create(path, fmLines.join('\n') + (body ? body + '\n' : ''));
       this.settings._shadow[`${source}:${t.id}`] = {
         due: t.due || null, priority: t.priority, description: body, done: false,
+        ...(source === 'todoist' ? { duration: plannedDuration(t.duration), durationOwned: true } : {}),
       };
       this.markSyncWrite(created || path);
     } catch { /* a race with another writer - the next sync settles it */ }
@@ -8606,13 +8641,14 @@ class IcorPlannerPlugin extends Plugin {
   // (due / priority / description); source-owned metadata always pulls.
   //
   // Every write below names its field. Planner-owned placement fields are not
-  // assigned by a source refresh; processFrontMatter preserves fields it does
+  // assigned by a source refresh, except an untouched, unscheduled Todoist
+  // duration estimate; processFrontMatter preserves fields it does
   // not name. The `ops` block below is the plan acting on itself when a
   // finished occurrence clears its own placement, never the source reaching in.
   // `plan` (optional) is the syncCompletionPlan result: the occurrence
   // advance and the reopen confirmation are applied to the note here, in the
   // same frontmatter write as the source pull.
-  async updateItemFile(prior, t, finals, currentBody, plan) {
+  async updateItemFile(prior, t, finals, currentBody, plan, shadow) {
     // `title` is a shared field since 0.15.0, so the settled value wins here
     // the way `due` and `priority` already did. An empty settled title falls
     // back to the source's: the note never blanks a task's name.
@@ -8623,6 +8659,8 @@ class IcorPlannerPlugin extends Plugin {
     const wantDueString = t.dueString ? String(t.dueString) : null;
     const wantParent = t.parentId ? String(t.parentId) : null;
     const ops = plan || {};
+    const durationPlan = todoistDurationPlan(prior, t, shadow);
+    let durationOwned = durationPlan ? durationPlan.owned : false;
     const hasOps = !!(ops.resetDoneLocal || ops.clearPlan || ops.movePlan || ops.occurrence || ops.clearReopenPending);
     const changed =
       prior.title !== wantTitle || prior.due !== wantDue ||
@@ -8630,7 +8668,7 @@ class IcorPlannerPlugin extends Plugin {
       prior.status === 'done' || // reopened at the source
       prior.recurring !== wantRecurring || prior.dueString !== wantDueString ||
       prior.parentId !== wantParent ||
-      hasOps ||
+      hasOps || !!(durationPlan && durationPlan.changed) ||
       JSON.stringify(prior.tags) !== JSON.stringify(t.tags || []) ||
       prior.sourceStatus !== (t.status || null) ||
       prior.listId !== (t.listId ? String(t.listId) : null);
@@ -8647,6 +8685,20 @@ class IcorPlannerPlugin extends Plugin {
         fm.recurring = wantRecurring;
         fm.due_string = wantDueString;
         fm.parent_id = wantParent;
+        // Recheck the actual note inside the write: a placement or hand edit
+        // made since collectItems must win over the source estimate.
+        if (durationPlan) {
+          const currentPlan = todoistDurationPlan({
+            ...prior, plannedDay: fm.planned_day, plannedStart: fm.planned_start,
+            plannedOccurrenceDue: fm.planned_occurrence_due,
+            plannedDuration: fm.planned_duration == null ? null : fm.planned_duration,
+          }, t, shadow);
+          durationOwned = currentPlan.owned;
+          if (currentPlan.changed) {
+            if (currentPlan.duration == null) delete fm.planned_duration;
+            else fm.planned_duration = currentPlan.duration;
+          }
+        }
         // Back in the open set: the source shows it open, whatever asked for
         // it, and the local check goes with the status (a reopen at the
         // source is a reopen here).
@@ -8660,6 +8712,12 @@ class IcorPlannerPlugin extends Plugin {
           delete fm.planned_start;
           delete fm.planned_duration;
           delete fm.planned_occurrence_due;
+          // The old timed occurrence was deliberately cleared. Seed the next
+          // occurrence's estimate without changing the recorded old duration.
+          if (prior.source === 'todoist') {
+            if (plannedDuration(t.duration) != null) fm.planned_duration = t.duration;
+            durationOwned = true;
+          }
         }
         if (ops.movePlan) {
           // Appended at the end of the lane: the tap-to-plan convention
@@ -8695,9 +8753,21 @@ class IcorPlannerPlugin extends Plugin {
         this.markSyncWrite(prior.file);
       }
     } catch { /* body refresh is cosmetic - never fail the sync on it */ }
+    return durationOwned;
   }
 
   /* ---- plan writes (the drag-and-drop write path) ------------------------- */
+  // Persist the handoff even if a task is placed and returned to the tray
+  // between syncs, or a resize happens to equal the last source estimate.
+  claimTodoistDuration(fm) {
+    if (fm.source !== 'todoist') return;
+    const shadow = this.settings._shadow[`todoist:${fm.external_id}`];
+    if (!shadow || shadow.durationOwned === false) return;
+    shadow.durationOwned = false;
+    if (this._shadowSaveTimer) window.clearTimeout(this._shadowSaveTimer);
+    this._shadowSaveTimer = window.setTimeout(() => this.persistSettings(), 1500);
+  }
+
   async assignItem(path, day, half, order) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return;
@@ -8705,6 +8775,7 @@ class IcorPlannerPlugin extends Plugin {
       fm.planned_day = day;
       fm.planned_half = half;
       fm.planned_order = order;
+      this.claimTodoistDuration(fm);
     });
   }
 
@@ -8713,18 +8784,25 @@ class IcorPlannerPlugin extends Plugin {
     if (!(file instanceof TFile)) return;
     const startMinute = plannedStartMinute(start);
     if (!validPlannerDay(day) || startMinute == null) return;
-    const boundedDuration = clampPlannedDuration(startMinute, duration);
     const occurrenceDue = isOccurrenceTracked(item) ? item.due : null;
     if (isOccurrenceTracked(item) && !validPlannerDay(occurrenceDue)) {
       new Notice('Planner: this recurring task needs an active due date before it can be scheduled.');
       return;
     }
+    const requestedDuration = duration == null
+      ? plannedDuration(item && item.plannedDuration) || PLANNER_DEFAULT_DURATION
+      : plannedDuration(duration) || PLANNER_DEFAULT_DURATION;
+    if (startMinute + requestedDuration > 1440) {
+      new Notice('Planner: planned time must fit within this date.');
+      return;
+    }
     await this.app.fileManager.processFrontMatter(file, (fm) => {
       fm.planned_day = day;
       fm.planned_start = start;
-      fm.planned_duration = boundedDuration;
+      fm.planned_duration = requestedDuration;
       if (occurrenceDue) fm.planned_occurrence_due = occurrenceDue;
       else delete fm.planned_occurrence_due;
+      this.claimTodoistDuration(fm);
     });
     this.emitModelChanged();
   }
@@ -8737,8 +8815,9 @@ class IcorPlannerPlugin extends Plugin {
       fm.planned_half = null;
       fm.planned_order = 0;
       delete fm.planned_start;
-      delete fm.planned_duration;
+      if (fm.source !== 'todoist') delete fm.planned_duration;
       delete fm.planned_occurrence_due;
+      this.claimTodoistDuration(fm);
     });
   }
 
@@ -10041,7 +10120,7 @@ function showPlanMenu(plugin, item, view, pos) {
     menu.addItem((mi) => mi
       .setTitle(`${label} · ${start}`)
       .setIcon('calendar')
-      .onClick(() => plugin.assignTimedItem(item.path, day, start, PLANNER_DEFAULT_DURATION, item)));
+      .onClick(() => plugin.assignTimedItem(item.path, day, start, null, item)));
   });
   menu.showAtPosition(pos);
 }
@@ -10247,6 +10326,7 @@ function wireTimedTaskResize(plugin, item, card, view) {
   const placement = activeTimedPlacement(item);
   if (!placement) return;
   let duration = placement.duration;
+  const minimumDuration = Math.min(PLANNER_SLOT_MINUTES, duration);
   const handle = document.createElement('button');
   handle.type = 'button';
   handle.className = 'iplan-time-resize';
@@ -10254,9 +10334,10 @@ function wireTimedTaskResize(plugin, item, card, view) {
   handle.setAttribute('aria-orientation', 'vertical');
   handle.setAttribute('aria-label', `Duration for ${item.title}`);
   const update = (next, persist) => {
-    duration = clampPlannedDuration(placement.start, next);
+    duration = clampPlannedDuration(placement.start,
+      item.source === 'todoist' ? Math.max(minimumDuration, next) : next);
     card.style.height = `${duration * PLANNER_PIXELS_PER_MINUTE}px`;
-    handle.setAttribute('aria-valuemin', String(PLANNER_SLOT_MINUTES));
+    handle.setAttribute('aria-valuemin', String(minimumDuration));
     handle.setAttribute('aria-valuemax', String(Math.floor((1440 - placement.start) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES));
     handle.setAttribute('aria-valuenow', String(duration));
     handle.title = `${duration} minutes`;
@@ -11344,8 +11425,7 @@ class PlannerBoardView extends ItemView {
     });
     wireTimedDrop(slots, grid, (path, start) => {
       const item = items.find((candidate) => candidate.path === path);
-      if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start),
-        clampPlannedDuration(start, PLANNER_DEFAULT_DURATION), item);
+      if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start), null, item);
     });
     this.relayoutTimedGrid(day);
 
