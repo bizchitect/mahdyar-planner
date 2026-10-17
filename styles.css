@@ -301,30 +301,6 @@ button.iplan-sync-btn.is-syncing svg {
   touch-action: none;
   cursor: grab;
 }
-.iplan-time-routine > .iplan-routine-kicker,
-.iplan-time-routine > .iplan-routine-detail-button { margin-right: var(--size-4-6); }
-.iplan-root button.iplan-plan-move {
-  all: unset;
-  position: absolute;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: var(--size-4-6);
-  height: min(100%, var(--size-4-6));
-  box-sizing: border-box;
-  cursor: ns-resize;
-  touch-action: none;
-  color: var(--iplan-paper);
-}
-.iplan-plan-move svg { width: var(--size-4-4); height: 100%; max-height: var(--size-4-4); }
-.iplan-root button.iplan-plan-move:hover { background: var(--iplan-wash); }
-.iplan-root button.iplan-plan-move:focus-visible {
-  outline: 2px solid var(--iplan-marker);
-  outline-offset: -2px;
-}
 .iplan-planned-time-controls {
   display: flex;
   flex-wrap: wrap;
@@ -1635,6 +1611,12 @@ ul.iplan-settings-list li { margin: 3px 0; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Keep timed routine titles identical across the compact resize threshold,
+ * overriding DAY card-title sizing without changing task typography. */
+.iplan-root .iplan-time-routine button.iplan-routine-detail-button {
+  font-size: 12.5px;
+  line-height: 1.3;
+}
 .iplan-root .iplan-time-routine.is-compact {
   padding: 0 2px;
   gap: 0;
@@ -1643,7 +1625,10 @@ ul.iplan-settings-list li { margin: 3px 0; }
   margin: 0;
   line-height: 1;
 }
-.iplan-root .iplan-time-routine { cursor: pointer; }
+.iplan-root .iplan-time-routine,
+.iplan-root .iplan-time-routine button.iplan-routine-detail-button { cursor: grab; }
+.iplan-root .iplan-time-routine.is-plan-moving,
+.iplan-root .iplan-time-routine.is-plan-moving button.iplan-routine-detail-button { cursor: grabbing; }
 .iplan-root .iplan-time-routine:focus-visible,
 .iplan-root button.iplan-routine-detail-button:focus-visible {
   outline: 1px solid var(--iplan-marker);
@@ -1766,6 +1751,20 @@ ul.iplan-settings-list li { margin: 3px 0; }
   outline-offset: -1px;
 }
 .iplan-root .has-outside-label button.iplan-routine-detail-button { display: none; }
+/* Inside titles keep their own header line, including compact 30-minute
+ * routines. Very short narrow-gutter fallbacks retain the inline row. */
+.iplan-root .iplan-time-routine:not(.has-outside-label):not(.is-inline-label-fallback) .iplan-routine-kicker {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.iplan-root .iplan-time-routine:not(.has-outside-label):not(.is-inline-label-fallback) button.iplan-routine-detail-button {
+  flex: 0 0 auto;
+}
+.iplan-root .iplan-time-routine .iplan-routine-time {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
 @media (any-pointer: coarse) {
   .iplan-root button.iplan-routine-outside-label {
     height: 44px;

@@ -9843,15 +9843,12 @@ function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded, hideTi
   const time = document.createElement('span');
   time.className = 'iplan-routine-time';
   time.textContent = routineTimeLabel(occ);
-  if (!shortBlock) {
-    meta.appendChild(kind);
-    meta.appendChild(time);
-  }
+  let ghostChip = null;
   if (state.ghost && !shortBlock) {
-    const chip = document.createElement('span');
-    chip.className = 'iplan-chip';
-    chip.textContent = 'SKIPPED';
-    meta.appendChild(chip);
+    ghostChip = document.createElement('span');
+    ghostChip.className = 'iplan-chip';
+    ghostChip.textContent = 'SKIPPED';
+    if (!timeScaled) meta.appendChild(ghostChip);
   }
   const title = document.createElement(timeScaled ? 'button' : 'div');
   title.className = 'iplan-card-title';
@@ -9863,19 +9860,26 @@ function renderRoutineCard(plugin, occ, view, timeScaled, detailExpanded, hideTi
     title.setAttribute('aria-label', detailLabel);
     title.setAttribute('aria-haspopup', 'dialog');
     title.setAttribute('data-routine-detail', occurrenceKey);
-    title.addEventListener('pointerdown', (event) => event.stopPropagation());
+    // Let the timed card distinguish a title click from a move gesture.
     title.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
       new RoutineDetailModal(plugin, occ, view, title).open();
     });
   }
+  if (!shortBlock) {
+    if (timeScaled) meta.appendChild(title);
+    else meta.appendChild(kind);
+    meta.appendChild(time);
+    if (timeScaled && ghostChip) meta.appendChild(ghostChip);
+  }
   if (shortBlock) {
     meta.appendChild(title);
+    if (timeScaled) meta.appendChild(time);
     card.appendChild(meta);
   } else {
     card.appendChild(meta);
-    if (!hideTitle) card.appendChild(title);
+    if (!timeScaled && !hideTitle) card.appendChild(title);
   }
 
   const steps = !timeScaled && expanded ? document.createElement('div') : null;
@@ -10214,6 +10218,9 @@ function snapDailyPlanMinute(minute, minimum, maximum, fallback) {
 
 function wireDailyPlanMove(element, handle, view, options) {
   const handles = [handle, ...(options.additionalHandles || [])];
+  const cardInteraction = options.cardInteraction === true;
+  const pointerTarget = cardInteraction ? element.ownerDocument : element;
+  let pointerActive = false;
   let activeHandle = handle;
   let value = options.value;
   let settledValue = options.value;
@@ -10223,12 +10230,23 @@ function wireDailyPlanMove(element, handle, view, options) {
     value = next;
     if (preview) options.preview(next);
     for (const control of handles) {
+      if (cardInteraction) {
+        control.title = `${options.label}: ${fmtMin(next)}. Drag to move; click for details.`;
+        continue;
+      }
       control.setAttribute('aria-valuenow', String(next));
       control.setAttribute('aria-valuetext', fmtMin(next));
       control.title = `${options.label}: ${fmtMin(next)}`;
     }
   };
   for (const control of handles) {
+    if (cardInteraction) {
+      // Keep the existing details button semantics and focus target, with
+      // keyboard movement on the card rather than an invisible grip.
+      control.setAttribute('aria-description',
+        'Drag to move this occurrence. Arrow Up or Down moves 15 minutes; Home or End moves to the date limit. Enter or Space opens details.');
+      continue;
+    }
     control.setAttribute('role', 'slider');
     control.setAttribute('aria-orientation', 'vertical');
     control.setAttribute('aria-label', options.label);
@@ -10245,20 +10263,27 @@ function wireDailyPlanMove(element, handle, view, options) {
   };
   paint(value, false);
   element.addEventListener('click', (event) => {
+    if (cardInteraction && event.detail === 0) return;
     if (!suppressClick) return;
     suppressClick = false;
     event.preventDefault();
     event.stopPropagation();
+    if (cardInteraction) event.stopImmediatePropagation();
   }, true);
-  for (const control of handles) control.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); });
+  if (!cardInteraction) for (const control of handles) control.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); });
   const begin = (event) => {
-    const onHandle = handles.some((control) => control.contains(event.target));
-    if (event.button !== 0 || (!onHandle && event.target.closest('button, a, input, label'))) return;
+    const onHandle = cardInteraction ? event.target === element
+      : handles.some((control) => control.contains(event.target));
+    const onTitle = cardInteraction && event.target.closest('.iplan-routine-detail-button');
+    if (event.button !== 0 || (cardInteraction && (!event.isPrimary || pointerActive))
+      || (!onHandle && !onTitle && event.target.closest('button, a, input, label'))) return;
     activeHandle = handles.find((control) => control.contains(event.target)) || handle;
     if (view.cancelDailyMove) view.cancelDailyMove();
     suppressClick = false;
     event.stopPropagation();
-    if (onHandle) event.preventDefault();
+    if (onHandle && !cardInteraction) event.preventDefault();
+    pointerActive = true;
+    const originX = event.clientX;
     const originY = event.clientY;
     const originScroll = options.scroll ? options.scroll.scrollTop : 0;
     const original = value;
@@ -10266,23 +10291,34 @@ function wireDailyPlanMove(element, handle, view, options) {
     const move = (nextEvent) => {
       if (nextEvent.pointerId !== event.pointerId) return;
       const delta = nextEvent.clientY - originY + (options.scroll ? options.scroll.scrollTop - originScroll : 0);
-      if (!moved && Math.abs(delta) < 5) return;
+      if (!moved && (cardInteraction ? Math.hypot(nextEvent.clientX - originX, delta) : Math.abs(delta)) < 5) return;
+      if (!moved && cardInteraction) {
+        element.classList.add('is-plan-moving');
+        if (nextEvent.type === 'pointermove' && element.setPointerCapture) element.setPointerCapture(event.pointerId);
+      }
       moved = true;
       nextEvent.preventDefault();
       paint(snapDailyPlanMinute(original + delta / PLANNER_PIXELS_PER_MINUTE,
         options.minimum, options.maximum, original));
     };
     const cleanup = () => {
-      element.removeEventListener('pointermove', move);
-      element.removeEventListener('pointerup', finish);
-      element.removeEventListener('pointercancel', cancel);
+      pointerActive = false;
+      if (cardInteraction) element.classList.remove('is-plan-moving');
+      pointerTarget.removeEventListener('pointermove', move);
+      pointerTarget.removeEventListener('pointerup', finish);
+      pointerTarget.removeEventListener('pointercancel', cancel);
       element.removeEventListener('lostpointercapture', cancel);
       document.removeEventListener('keydown', escape, true);
       if (element.hasPointerCapture && element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
       if (view.cancelDailyMove === abort) view.cancelDailyMove = null;
     };
     const abort = () => { cleanup(); paint(original); suppressClick = moved; };
-    const cancel = (nextEvent) => { if (nextEvent.pointerId === event.pointerId) abort(); };
+    const cancel = (nextEvent) => {
+      // Taking capture from a touch title can bubble its own capture loss.
+      // Only loss of the card's capture cancels the card gesture.
+      if (cardInteraction && nextEvent.type === 'lostpointercapture' && nextEvent.target !== element) return;
+      if (nextEvent.pointerId === event.pointerId) abort();
+    };
     const escape = (nextEvent) => {
       if (nextEvent.key !== 'Escape') return;
       nextEvent.preventDefault();
@@ -10297,17 +10333,19 @@ function wireDailyPlanMove(element, handle, view, options) {
       if (moved && value !== original) commit(value);
     };
     view.cancelDailyMove = abort;
-    element.addEventListener('pointermove', move);
-    element.addEventListener('pointerup', finish);
-    element.addEventListener('pointercancel', cancel);
+    pointerTarget.addEventListener('pointermove', move);
+    pointerTarget.addEventListener('pointerup', finish);
+    pointerTarget.addEventListener('pointercancel', cancel);
     element.addEventListener('lostpointercapture', cancel);
     document.addEventListener('keydown', escape, true);
-    if (element.setPointerCapture) element.setPointerCapture(event.pointerId);
+    // Preserve the title's native click target until the drag threshold.
+    if (!cardInteraction && element.setPointerCapture) element.setPointerCapture(event.pointerId);
   };
   element.addEventListener('pointerdown', begin);
   for (const control of handles) {
     if (control !== element) control.addEventListener('pointerdown', begin);
     control.addEventListener('keydown', (event) => {
+      if (cardInteraction && (event.target !== control || pointerActive)) return;
       if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault();
       event.stopPropagation();
@@ -10325,66 +10363,108 @@ function wireDailyPlanMove(element, handle, view, options) {
 function wireTimedTaskResize(plugin, item, card, view) {
   const placement = activeTimedPlacement(item);
   if (!placement) return;
+  const focusKey = `resize:task:${item.path}:${placement.day}`;
+  const handle = wireTimedResize(card, view, placement, {
+    label: `Duration for ${item.title}`,
+    preview: (duration) => { item.plannedDuration = duration; },
+    save: (duration) => {
+      if (view) view.pendingPlanFocus = focusKey;
+      return plugin.assignTimedItem(item.path, placement.day, plannedStartText(placement.start), duration, item);
+    },
+  });
+  handle.setAttribute('data-plan-focus', focusKey);
+}
+
+// Shared bottom-edge interaction. The caller owns persistence so a routine
+// resize can only change this date's existing start/end override.
+function wireTimedResize(card, view, placement, options) {
   let duration = placement.duration;
-  const minimumDuration = Math.min(PLANNER_SLOT_MINUTES, duration);
+  let pointerResizeActive = false;
+  const stepMinutes = options.stepMinutes ?? PLANNER_SLOT_MINUTES;
+  const maximumDuration = 1440 - placement.start;
+  const minimumDuration = Math.min(options.minimumDuration ?? PLANNER_SLOT_MINUTES, duration, maximumDuration);
   const handle = document.createElement('button');
   handle.type = 'button';
   handle.className = 'iplan-time-resize';
   handle.setAttribute('role', 'slider');
   handle.setAttribute('aria-orientation', 'vertical');
-  handle.setAttribute('aria-label', `Duration for ${item.title}`);
+  handle.setAttribute('aria-label', options.label);
   const update = (next, persist) => {
-    duration = clampPlannedDuration(placement.start,
-      item.source === 'todoist' ? Math.max(minimumDuration, next) : next);
+    duration = clampPlannedDuration(placement.start, Math.max(minimumDuration, next));
     card.style.height = `${duration * PLANNER_PIXELS_PER_MINUTE}px`;
     handle.setAttribute('aria-valuemin', String(minimumDuration));
-    handle.setAttribute('aria-valuemax', String(Math.floor((1440 - placement.start) / PLANNER_SLOT_MINUTES) * PLANNER_SLOT_MINUTES));
+    handle.setAttribute('aria-valuemax', String(maximumDuration));
     handle.setAttribute('aria-valuenow', String(duration));
     handle.title = `${duration} minutes`;
-    item.plannedDuration = duration;
+    options.preview(duration);
     if (persist) {
-      plugin.assignTimedItem(item.path, placement.day, plannedStartText(placement.start), duration, item);
+      options.save(duration);
       if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
     }
   };
   update(duration, false);
   handle.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || pointerResizeActive) return;
     event.preventDefault();
     event.stopPropagation();
+    if (view && view.cancelDailyMove) view.cancelDailyMove();
+    pointerResizeActive = true;
     const startY = event.clientY;
     const startDuration = duration;
     const move = (nextEvent) => {
       if (nextEvent.pointerId !== event.pointerId) return;
-      const steps = Math.round((nextEvent.clientY - startY) / (PLANNER_SLOT_MINUTES * PLANNER_PIXELS_PER_MINUTE));
-      update(startDuration + steps * PLANNER_SLOT_MINUTES, false);
+      const steps = Math.round((nextEvent.clientY - startY) / (stepMinutes * PLANNER_PIXELS_PER_MINUTE));
+      update(startDuration + steps * stepMinutes, false);
       if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
     };
-    const finish = (nextEvent) => {
-      if (nextEvent.pointerId !== event.pointerId) return;
+    const cleanup = () => {
+      pointerResizeActive = false;
       handle.removeEventListener('pointermove', move);
       handle.removeEventListener('pointerup', finish);
       handle.removeEventListener('pointercancel', cancel);
-      if (nextEvent.type === 'pointerup') update(duration, true);
-      else update(startDuration, false);
+      handle.removeEventListener('lostpointercapture', cancel);
+      document.removeEventListener('keydown', escape, true);
+      if (handle.hasPointerCapture && handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      if (view && view.cancelDailyMove === abort) view.cancelDailyMove = null;
+    };
+    const abort = () => {
+      cleanup();
+      update(startDuration, false);
       if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
     };
-    const cancel = (nextEvent) => finish(nextEvent);
+    const cancel = (nextEvent) => { if (nextEvent.pointerId === event.pointerId) abort(); };
+    const escape = (nextEvent) => {
+      if (nextEvent.key !== 'Escape') return;
+      nextEvent.preventDefault();
+      nextEvent.stopPropagation();
+      abort();
+    };
+    const finish = (nextEvent) => {
+      if (nextEvent.pointerId !== event.pointerId) return;
+      move(nextEvent);
+      cleanup();
+      update(duration, true);
+    };
+    if (view) view.cancelDailyMove = abort;
     handle.addEventListener('pointermove', move);
     handle.addEventListener('pointerup', finish);
     handle.addEventListener('pointercancel', cancel);
+    handle.addEventListener('lostpointercapture', cancel);
+    document.addEventListener('keydown', escape, true);
     if (typeof handle.setPointerCapture === 'function') handle.setPointerCapture(event.pointerId);
   });
   handle.addEventListener('keydown', (event) => {
     if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown' && event.key !== 'Home' && event.key !== 'End') return;
     event.preventDefault();
+    event.stopPropagation();
+    if (pointerResizeActive) return;
     let nextDuration;
     if (event.key === 'Home') {
       nextDuration = Number(handle.getAttribute('aria-valuemin'));
     } else if (event.key === 'End') {
       nextDuration = Number(handle.getAttribute('aria-valuemax'));
     } else {
-      nextDuration = duration + (event.key === 'ArrowUp' ? PLANNER_SLOT_MINUTES : -PLANNER_SLOT_MINUTES);
+      nextDuration = duration + (event.key === 'ArrowUp' ? stepMinutes : -stepMinutes);
     }
     update(nextDuration, true);
   });
@@ -10393,6 +10473,7 @@ function wireTimedTaskResize(plugin, item, card, view) {
     event.stopPropagation();
   });
   card.appendChild(handle);
+  return handle;
 }
 
 /* ========================================================================== *
@@ -11013,6 +11094,9 @@ class PlannerBoardView extends ItemView {
   render() {
     if (this.cancelDailyMove) this.cancelDailyMove();
     const el = this.contentEl;
+    const focusedElement = el.ownerDocument.activeElement;
+    const boardHadFocus = !!(focusedElement && el.contains(focusedElement) && focusedElement.closest('.iplan-board'));
+    const planFocus = this.pendingPlanFocus || (boardHadFocus ? focusedElement.getAttribute('data-plan-focus') : null);
     el.dataset.layout = this.layout;
     el.empty();
     this.timedGrids.clear();
@@ -11197,11 +11281,11 @@ class PlannerBoardView extends ItemView {
     foot.createSpan({ text: stamp });
     foot.createSpan({ cls: 'iplan-foot-dot', text: ' · ' });
     foot.createSpan({ text: fmtOpenItems(items.filter((i) => !isDone(i)).length) });
-    if (this.pendingPlanFocus && !this.routineDetailModal) {
-      const focus = el.querySelector(`[data-plan-focus="${CSS.escape(this.pendingPlanFocus)}"]`);
+    if (planFocus && boardHadFocus && !this.routineDetailModal) {
+      const focus = el.querySelector(`[data-plan-focus="${CSS.escape(planFocus)}"]`);
       if (focus) focus.focus({ preventScroll: true });
-      this.pendingPlanFocus = null;
     }
+    this.pendingPlanFocus = null;
   }
 
   renderOverviewDay(day, col, items, events, routines) {
@@ -11322,8 +11406,9 @@ class PlannerBoardView extends ItemView {
 
     const bounds = timedGridBounds(0, 1440, entries);
     const height = (bounds.end - bounds.start) * PLANNER_PIXELS_PER_MINUTE;
-    const outside = entries.some((entry) => entry.kind === 'routine' && entry.duration <= 30);
-    const labelOverflow = outside ? col.createEl('button', {
+    const hasRoutines = entries.some((entry) => entry.kind === 'routine');
+    const outside = entries.some((entry) => entry.kind === 'routine' && entry.duration < 30);
+    const labelOverflow = hasRoutines ? col.createEl('button', {
       cls: 'iplan-routine-label-overflow',
       attr: { type: 'button', 'aria-haspopup': 'dialog', 'data-routine-detail': day },
     }) : null;
@@ -11337,7 +11422,8 @@ class PlannerBoardView extends ItemView {
     const axis = canvas.createDiv({ cls: 'iplan-time-axis' });
     const slots = canvas.createDiv({ cls: 'iplan-time-slots', attr: { 'data-day': day } });
     slots.style.height = `${height}px`;
-    const labelGutter = hasGutter ? canvas.createDiv({ cls: 'iplan-routine-label-gutter' }) : null;
+    // Prepare labels even for long routines so a live resize can cross 30 minutes.
+    const labelGutter = hasGutter || hasRoutines ? canvas.createDiv({ cls: 'iplan-routine-label-gutter' }) : null;
     const workdayLabels = this.renderTimedWorkdayMarkers(day, axis, slots, bounds, scroll, labelGutter);
     const hourLabels = [];
     for (let minute = bounds.start; minute <= bounds.end; minute += 60) {
@@ -11374,8 +11460,7 @@ class PlannerBoardView extends ItemView {
       } else if (entry.kind === 'routine') {
         element = renderRoutineCard(this.plugin, entry.occ, this, true);
         slots.appendChild(element);
-        if (labelGutter && entry.duration <= 30) {
-          element.classList.add('has-outside-label');
+        if (labelGutter) {
           const detail = element.querySelector('.iplan-routine-detail-button');
           const label = labelGutter.createEl('button', {
             cls: 'iplan-routine-outside-label', text: entry.occ.routine.name,
@@ -11385,8 +11470,10 @@ class PlannerBoardView extends ItemView {
             },
           });
           label.addEventListener('click', () => new RoutineDetailModal(this.plugin, entry.occ, this, label).open());
+          label.hidden = true;
           entry.labelElement = label;
           entry.labelLeader = canvas.createDiv({ cls: 'iplan-routine-label-leader', attr: { 'aria-hidden': 'true' } });
+          entry.labelLeader.hidden = true;
           entry.labelLeader.createDiv({ cls: 'iplan-routine-label-line' });
           entry.labelLeader.createDiv({ cls: 'iplan-routine-label-bend' });
           entry.labelLeader.createDiv({ cls: 'iplan-routine-label-line' });
@@ -11399,14 +11486,48 @@ class PlannerBoardView extends ItemView {
       element.style.top = `${(entry.start - bounds.start) * PLANNER_PIXELS_PER_MINUTE}px`;
       element.style.height = `${entry.duration * PLANNER_PIXELS_PER_MINUTE}px`;
       if (entry.kind === 'routine') {
-        const handle = element.createEl('button', { cls: 'iplan-plan-move', attr: { type: 'button', 'data-plan-focus': entry.key } });
-        setIcon(handle, 'move-vertical');
-        wireDailyPlanMove(element, handle, this, {
+        const updateRoutineTime = () => {
+          const range = `${fmtMin(entry.start)} - ${fmtMin(entry.end)}`;
+          const time = element.querySelector('.iplan-routine-time');
+          if (time) time.textContent = range;
+          const detail = `${entry.occ.routine.name}, ${day}, ${range}${entry.occ.skipped ? ', skipped' : ''}`;
+          element.title = detail;
+          element.setAttribute('aria-label', detail);
+          const detailButton = element.querySelector('.iplan-routine-detail-button');
+          if (detailButton) {
+            detailButton.title = detail;
+            detailButton.setAttribute('aria-label', detail);
+          }
+          if (entry.labelElement) {
+            entry.labelElement.title = detail;
+            entry.labelElement.setAttribute('aria-label', detail);
+          }
+        };
+        const resize = wireTimedResize(element, this, { day, start: entry.start, duration: entry.duration }, {
+          label: `Duration for ${entry.occ.routine.name} on ${day}, this occurrence only`,
+          minimumDuration: 15,
+          stepMinutes: 15,
+          preview: (duration) => {
+            entry.duration = duration;
+            entry.end = entry.start + duration;
+            updateRoutineTime();
+          },
+          save: (duration) => {
+            this.pendingPlanFocus = `resize:${entry.key}`;
+            return this.plugin.setDailyPlannedTime(day, entry.occ.routine.path,
+              { start: entry.start, end: entry.start + duration });
+          },
+        });
+        resize.setAttribute('data-plan-focus', `resize:${entry.key}`);
+        element.setAttribute('data-plan-focus', entry.key);
+        wireDailyPlanMove(element, element, this, {
+          cardInteraction: true,
           value: entry.start, minimum: 0, maximum: 1440 - entry.duration, scroll,
-          label: `Planned start for ${entry.occ.routine.name} on ${day}`,
+          label: `Planned start for ${entry.occ.routine.name} on ${day}, this occurrence only`,
           preview: (start) => {
             entry.start = start;
             entry.end = start + entry.duration;
+            updateRoutineTime();
             if (entry.element && this.timedGrids.has(day)) this.relayoutTimedGrid(day);
           },
           save: (start) => this.plugin.setDailyPlannedTime(day, entry.occ.routine.path, { start }),
@@ -11518,6 +11639,21 @@ class PlannerBoardView extends ItemView {
   relayoutTimedGrid(day) {
     const grid = this.timedGrids.get(day);
     if (!grid) return;
+    for (const entry of grid.entries) {
+      if (entry.kind !== 'routine') continue;
+      // Title placement is independent of compact styling (which includes 30).
+      entry.shouldUseOutsideLabel = entry.duration < 30;
+      entry.element.classList.toggle('is-compact', entry.duration <= 30);
+      entry.element.classList.remove('has-outside-label', 'is-inline-label-fallback');
+      entry.labelElement.hidden = true;
+      entry.labelLeader.hidden = true;
+    }
+    const hasGutter = grid.entries.some((entry) => entry.shouldUseOutsideLabel)
+      || (grid.workdayLabels || []).some((marker) => marker.titleElement);
+    grid.canvas.classList.toggle('has-outside-routine-labels', hasGutter);
+    if (grid.labelGutter) grid.labelGutter.hidden = !hasGutter;
+    grid.hiddenRoutineEntries = [];
+    if (grid.labelOverflow) grid.labelOverflow.hidden = true;
     if (grid.pendingSavedScrollTop != null && grid.canvas.getClientRects().length
       && grid.scroll.getBoundingClientRect().height > 0) {
       grid.scroll.scrollTop = grid.pendingSavedScrollTop;
@@ -11556,7 +11692,7 @@ class PlannerBoardView extends ItemView {
     const height = Math.ceil(contentEnd);
     grid.slots.style.height = `${height}px`;
     grid.canvas.style.height = `${height}px`;
-    const labels = grid.entries.filter((entry) => entry.labelElement).map((entry) => {
+    const labels = grid.entries.filter((entry) => entry.shouldUseOutsideLabel && entry.labelElement).map((entry) => {
       entry.labelElement.hidden = false;
       const labelHeight = entry.labelElement.getBoundingClientRect().height;
       const anchor = (entry.start - grid.start + entry.duration / 2) * PLANNER_PIXELS_PER_MINUTE;
