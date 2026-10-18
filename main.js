@@ -1188,12 +1188,12 @@ const PLANNER_DEFAULT_DURATION = 60;
 const PLANNER_PIXELS_PER_MINUTE = 1;
 
 function plannedStartMinute(value) {
-  const match = /^(?:[01]\d|2[0-3]):(00|30)$/.exec(String(value == null ? '' : value));
+  const match = /^(?:[01]\d|2[0-3]):([0-5]\d)$/.exec(String(value == null ? '' : value));
   return match ? Number(match[0].slice(0, 2)) * 60 + Number(match[1]) : null;
 }
 
 function plannedDuration(value) {
-  // Starts still snap to the grid; durations can be exact source minutes.
+  // Durations can be exact source minutes, independent of grid snapping.
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
@@ -8781,44 +8781,76 @@ class IcorPlannerPlugin extends Plugin {
 
   async assignTimedItem(path, day, start, duration, item) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
+    if (!(file instanceof TFile)) {
+      new Notice('Planner: the task note could not be found. Refresh the view before scheduling it.');
+      return false;
+    }
     const startMinute = plannedStartMinute(start);
-    if (!validPlannerDay(day) || startMinute == null) return;
+    if (!validPlannerDay(day) || startMinute == null) {
+      new Notice('Planner: choose a valid date and start time.');
+      return false;
+    }
     const occurrenceDue = isOccurrenceTracked(item) ? item.due : null;
     if (isOccurrenceTracked(item) && !validPlannerDay(occurrenceDue)) {
       new Notice('Planner: this recurring task needs an active due date before it can be scheduled.');
-      return;
+      return false;
     }
     const requestedDuration = duration == null
       ? plannedDuration(item && item.plannedDuration) || PLANNER_DEFAULT_DURATION
       : plannedDuration(duration) || PLANNER_DEFAULT_DURATION;
     if (startMinute + requestedDuration > 1440) {
       new Notice('Planner: planned time must fit within this date.');
-      return;
+      return false;
     }
-    await this.app.fileManager.processFrontMatter(file, (fm) => {
-      fm.planned_day = day;
-      fm.planned_start = start;
-      fm.planned_duration = requestedDuration;
-      if (occurrenceDue) fm.planned_occurrence_due = occurrenceDue;
-      else delete fm.planned_occurrence_due;
-      this.claimTodoistDuration(fm);
-    });
+    try {
+      await this.app.fileManager.processFrontMatter(file, (fm) => {
+        fm.planned_day = day;
+        fm.planned_start = start;
+        fm.planned_duration = requestedDuration;
+        if (occurrenceDue) fm.planned_occurrence_due = occurrenceDue;
+        else delete fm.planned_occurrence_due;
+        this.claimTodoistDuration(fm);
+      });
+    } catch (error) {
+      console.error('icor-planner: could not schedule task', path, error);
+      new Notice('Planner: the task could not be scheduled. Check the task note and try again.');
+      return false;
+    }
     this.emitModelChanged();
+    return true;
   }
 
-  async unassignItem(path) {
+  async unassignItem(path, retainDay = false) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
-    await this.app.fileManager.processFrontMatter(file, (fm) => {
-      fm.planned_day = null;
-      fm.planned_half = null;
-      fm.planned_order = 0;
-      delete fm.planned_start;
-      if (fm.source !== 'todoist') delete fm.planned_duration;
-      delete fm.planned_occurrence_due;
-      this.claimTodoistDuration(fm);
-    });
+    if (!(file instanceof TFile)) {
+      new Notice('Planner: the task note could not be found. Refresh the view before returning it to the backlog.');
+      return false;
+    }
+    try {
+      await this.app.fileManager.processFrontMatter(file, (fm) => {
+        if (retainDay) {
+          // Keep the weekly lane and hand order; only infer a missing half.
+          const start = plannedStartMinute(fm.planned_start);
+          if (fm.planned_half !== 'am' && fm.planned_half !== 'pm' && start != null) {
+            fm.planned_half = routineHalf(start, this.splitHM());
+          }
+        } else {
+          fm.planned_day = null;
+          fm.planned_half = null;
+          fm.planned_order = 0;
+          if (fm.source !== 'todoist') delete fm.planned_duration;
+        }
+        delete fm.planned_start;
+        delete fm.planned_occurrence_due;
+        this.claimTodoistDuration(fm);
+      });
+    } catch (error) {
+      console.error('icor-planner: could not return task to backlog', path, error);
+      new Notice('Planner: the task could not be returned to the backlog. Check the task note and try again.');
+      return false;
+    }
+    this.emitModelChanged();
+    return true;
   }
 
   // The check toggles the EFFECTIVE done state (isDone), not the flag alone:
@@ -9498,10 +9530,19 @@ function sourceMarkEl(source) {
   const meta = SOURCES[source] || SOURCES.todoist;
   const span = document.createElement('span');
   span.className = `iplan-source-mark iplan-source-${source}`;
+  span.setAttribute('role', 'img');
   span.setAttribute('aria-label', meta.label);
   const svgNS = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(svgNS, 'svg');
   svg.setAttribute('viewBox', '0 0 24 24');
+  if (source === 'todoist') {
+    const backing = document.createElementNS(svgNS, 'rect');
+    backing.setAttribute('width', '24');
+    backing.setAttribute('height', '24');
+    backing.setAttribute('rx', '3');
+    backing.setAttribute('class', 'iplan-todoist-backing');
+    svg.appendChild(backing);
+  }
   const path = document.createElementNS(svgNS, 'path');
   path.setAttribute('d', meta.svg);
   svg.appendChild(path);
@@ -9636,8 +9677,8 @@ function renderCard(plugin, item, mode, view) {
   titleEl.textContent = item.title;
   const meta = document.createElement('div');
   meta.className = 'iplan-card-meta';
-  meta.appendChild(sourceMarkEl(item.source));
-  for (const c of cardChips(item, today, ghost)) {
+  const chips = cardChips(item, today, ghost);
+  for (const c of chips) {
     const chip = document.createElement('span');
     chip.className = c.cls;
     if (c.icon) {
@@ -9649,13 +9690,25 @@ function renderCard(plugin, item, mode, view) {
     }
     meta.appendChild(chip);
   }
-  bodyEl.appendChild(titleEl);
-  bodyEl.appendChild(meta);
+  const titleRow = document.createElement('div');
+  titleRow.className = 'iplan-card-title-row';
+  titleRow.appendChild(check);
+  titleRow.appendChild(titleEl);
+  titleRow.appendChild(sourceMarkEl(item.source));
+  bodyEl.appendChild(titleRow);
+  if (meta.childNodes.length) bodyEl.appendChild(meta);
+  if (mode === 'timed') {
+    card.title = [
+      item.title,
+      parent ? `Part of ${parent.title}` : '',
+      (SOURCES[item.source] || SOURCES.todoist).label,
+      ...chips.map((chip) => chip.label || chip.text),
+    ].filter(Boolean).join('\n');
+  }
   // The subtask counter and its list, on a live parent card only.
   const counter = !ghost && plugin.settings.subtaskChecklist !== false ? subtaskCounter(item, index) : null;
   if (counter) renderSubtaskRow(plugin, item, index, counter, bodyEl, view);
 
-  card.appendChild(check);
   card.appendChild(bodyEl);
 
   // Click opens the local note; the source link lives in the context menu.
@@ -10087,8 +10140,12 @@ function showCardMenu(plugin, item, view, pos) {
   }
   menu.addItem((mi) => mi.setTitle('Plan on...')
     .setIcon('calendar').onClick(() => showPlanMenu(plugin, item, view, pos)));
+  if (activeTimedPlacement(item)) {
+    menu.addItem((mi) => mi.setTitle('Send to Today Backlog')
+      .setIcon('calendar-minus').onClick(() => plugin.unassignItem(item.path, true)));
+  }
   if (item.plannedDay) {
-    menu.addItem((mi) => mi.setTitle('Send back to tray')
+    menu.addItem((mi) => mi.setTitle('Send to Weekly Backlog')
       .setIcon('inbox').onClick(() => plugin.unassignItem(item.path)));
   }
   if (item.url) {
@@ -10360,13 +10417,18 @@ function wireDailyPlanMove(element, handle, view, options) {
   }
 }
 
+const TIMED_TASK_COMPACT_MINUTES = 30;
+
 function wireTimedTaskResize(plugin, item, card, view) {
   const placement = activeTimedPlacement(item);
   if (!placement) return;
   const focusKey = `resize:task:${item.path}:${placement.day}`;
   const handle = wireTimedResize(card, view, placement, {
     label: `Duration for ${item.title}`,
-    preview: (duration) => { item.plannedDuration = duration; },
+    preview: (duration) => {
+      item.plannedDuration = duration;
+      card.classList.toggle('is-compact', duration <= TIMED_TASK_COMPACT_MINUTES);
+    },
     save: (duration) => {
       if (view) view.pendingPlanFocus = focusKey;
       return plugin.assignTimedItem(item.path, placement.day, plannedStartText(placement.start), duration, item);
@@ -11224,6 +11286,7 @@ class PlannerBoardView extends ItemView {
     this._countdown = null;
     const today = todayStr();
     const isDay = this.mode === 'day';
+    this.renderedToday = today;
     const isCalendar = this.layout === 'calendar';
     const isWeeklyPlanning = this.weeklyPlanning && !isDay;
     const items = collectItems(this.plugin.app, this.plugin.paths().root);
@@ -11416,7 +11479,9 @@ class PlannerBoardView extends ItemView {
     if (isCalendar && !isDay) board.addClass('is-week-calendar');
     if (isWeeklyPlanning) board.addClass('is-weekly-planning');
     if (isDay) board.addClass('is-day');
+    if (isDay && isCalendar) board.addClass('is-day-calendar');
     board.style.setProperty('--iplan-day-count', String(visibleDays.length));
+    if (isDay && isCalendar) this.renderDayBacklog(this.day, board, items);
 
     const allDayByDay = new Map();
     for (const ev of events) {
@@ -11483,7 +11548,7 @@ class PlannerBoardView extends ItemView {
         return this.showPlanningDailyRoutines || !daily;
       });
       if (isCalendar) {
-        this.renderUntimedTasks(day, col, items);
+        if (!isDay) this.renderUntimedTasks(day, col, items);
         this.renderTimedGrid(day, col, items, events, routines);
       } else {
         this.renderOverviewDay(day, col, items, events, routines);
@@ -11572,6 +11637,69 @@ class PlannerBoardView extends ItemView {
         const current = sequence.filter((entry) => entry.kind !== 'task' || entry.path !== path);
         const order = this.plugin.orderForInsert(current, index);
         this.plugin.assignItem(path, day, half, order);
+      });
+    }
+  }
+
+  renderDayBacklog(day, board, items) {
+    const tasks = items.filter((item) => item.plannedDay === day
+      && !item.ghost && !isDone(item) && !activeTimedPlacement(item));
+    const halfRank = { am: 0, pm: 1 };
+    tasks.sort((a, b) => ((halfRank[a.plannedHalf] ?? 2) - (halfRank[b.plannedHalf] ?? 2))
+      || a.plannedOrder - b.plannedOrder);
+    const section = board.createEl('section', { cls: 'iplan-day iplan-day-backlog',
+      attr: { 'aria-label': `Today Backlog for ${day}` } });
+    section.addEventListener('dragover', (event) => {
+      if (!Array.from(event.dataTransfer.types).includes('text/plain')) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      section.addClass('is-drop-target');
+    });
+    section.addEventListener('dragleave', (event) => {
+      if (!section.contains(event.relatedTarget)) section.removeClass('is-drop-target');
+    });
+    section.addEventListener('drop', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      section.removeClass('is-drop-target');
+      const path = event.dataTransfer.getData('text/plain');
+      const item = items.find((candidate) => candidate.path === path);
+      if (!item || item.ghost || isDone(item) || item.plannedDay !== day) {
+        new Notice('Planner: drop an unfinished task planned for this date into Today Backlog.');
+        return;
+      }
+      if (!activeTimedPlacement(item)) return;
+      this.plugin.unassignItem(path, true);
+    });
+    const head = section.createDiv({ cls: 'iplan-day-head' });
+    head.createEl('h2', { cls: 'iplan-day-backlog-title', text: 'Today Backlog' });
+    for (const item of tasks) {
+      const card = renderCard(this.plugin, item, 'board', this);
+      section.appendChild(card);
+      const button = card.querySelector('.iplan-card-body').createEl('button', {
+        cls: 'iplan-backlog-schedule', text: 'Schedule now',
+        attr: { type: 'button', 'aria-label': `Schedule ${item.title} at the current time today`,
+          'data-plan-focus': `backlog:${item.path}` },
+      });
+      button.disabled = day !== todayStr();
+      button.title = button.disabled ? 'Schedule now is available only for today.' : 'Use the current time and this task\'s planned duration.';
+      button.addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (day !== todayStr()) {
+          button.disabled = true;
+          new Notice('Planner: Schedule now is available only for today. Drag the task to schedule another date.');
+          return;
+        }
+        button.disabled = true;
+        const now = new Date();
+        this.pendingPlanFocus = `backlog:${item.path}`;
+        try {
+          await this.plugin.assignTimedItem(item.path, day,
+            plannedStartText(now.getHours() * 60 + now.getMinutes()), null, item);
+        } finally {
+          button.disabled = day !== todayStr();
+        }
       });
     }
   }
@@ -11922,6 +12050,7 @@ class PlannerBoardView extends ItemView {
         entry.duration = duration;
         entry.end = entry.start + duration;
       }
+      if (entry.element) entry.element.classList.toggle('is-compact', entry.duration <= TIMED_TASK_COMPACT_MINUTES);
     }
     const layout = timedGridColumns(grid.entries);
     let contentEnd = (grid.end - grid.start) * PLANNER_PIXELS_PER_MINUTE;
@@ -12010,6 +12139,10 @@ class PlannerBoardView extends ItemView {
 
   // The live day-progress marker on today's column (cockpit's progress rail).
   updateNowRail() {
+    if (this.renderedToday !== todayStr()) {
+      this.render();
+      return;
+    }
     if (!this._todayCol || !this._nowRail || !this._todayCol.isConnected) return;
     const { start, end } = workdayFor(todayStr(), this.plugin.settings);
     const now = new Date();

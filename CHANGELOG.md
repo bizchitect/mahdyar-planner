@@ -6,6 +6,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 Releases before 0.12.0 carry their notes on the GitHub release itself
 (the commit subjects since the previous tag).
 
+## [1.2.1] - 2026-10-18
+
+### Added
+- Today Backlog beside the daily Calendar, on the left, with unfinished tasks
+  in their weekly-planning order.
+- Schedule now at the exact current minute, available only for today, and
+  drag-and-drop from the backlog onto the calendar.
+- Return calendar tasks to Today Backlog through their menu or by dragging
+  them into the backlog, preserving date, duration and weekly-planning order.
+- Send to Weekly Backlog replaces Send back to tray.
+
+### Improved
+- Task cards align the checkbox, title and right-side source icon in one row.
+  Todoist uses its red tile with white lines.
+- Calendar tasks of 30 minutes or less use a compact single row with full
+  details on hover and a right-edge duration grip.
+- Scheduling and backlog-return failures show an explicit notice.
+
 ## [1.2.0] - 2026-10-18
 
 ### Added

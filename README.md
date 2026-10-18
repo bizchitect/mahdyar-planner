@@ -70,6 +70,36 @@ one and it is scheduled.
 The **tray** sits in the right sidebar with four tabs: unscheduled tasks,
 your calendar, your routines and your habits.
 
+In the daily **Calendar** view, **Today Backlog** sits to the left of the calendar.
+It lists unfinished tasks planned for the selected day that do not yet have
+a calendar time, in the weekly-planning sequence (morning before afternoon).
+Drag a task onto the calendar to choose its time, or use **Schedule now**
+to place it at the exact current local time with its planned duration
+(one hour when no duration is set). Schedule now is available only for today.
+The existing 30-minute grid still applies to drag-and-drop. Scheduling stays
+in the planner; it does not create an event in a connected calendar.
+At narrow widths the backlog appears above the calendar, with the same keyboard order.
+For a timed task, **Send to Today Backlog** removes its calendar time while
+keeping its planned date, duration and weekly-planning order, even when viewing
+another date. Its morning or afternoon lane is kept, or inferred from its
+start time if none was set. Dragging a calendar task into Today Backlog has
+the same effect; dropping onto an existing backlog card or the empty area
+does not change its weekly-planning order. Only unfinished tasks planned for
+the displayed date can be returned this way.
+**Send to Weekly Backlog** returns a planned task
+to the tray using the existing unscheduled-task rules and filters. These
+actions do not change the task's source due date or completion.
+
+Task cards show their source icon on the right of the title. The checkbox,
+title and icon share a vertically centered row, including on longer tasks.
+Todoist icons use a red tile with white lines throughout the planner.
+Tasks of 30 minutes or less use a compact
+single row with checkbox, an ellipsis title and icon; hover shows the full title
+and metadata. Secondary chips, parent labels and subtask lists are hidden only
+in these compact cards. Their resize grip sits on the right edge to keep the
+single row clear, and resizing still changes duration vertically. Larger cards
+keep their bottom resize grip. Calendar block heights still match exact minutes.
+
 **Routines and habits** live here too, so the things you do every week are on
 the same surface as the things you only do once.
 
