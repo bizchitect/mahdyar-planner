@@ -164,6 +164,77 @@ button.iplan-sync-btn.is-syncing svg {
 .iplan-day.is-today {
   box-shadow: inset 2px 0 0 var(--iplan-marker);
 }
+.iplan-planning-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-top: 14px;
+}
+.iplan-planning-filter { display: inline-flex; align-items: center; gap: 6px; }
+.iplan-planning-filter:has(input:disabled) { color: var(--iplan-dim); }
+.iplan-planning-calendars {
+  position: relative;
+  max-width: 100%;
+}
+.iplan-planning-calendars > summary {
+  cursor: pointer;
+  padding: var(--size-4-1) var(--size-4-2);
+  border: 1px solid var(--iplan-hairline);
+  border-radius: var(--radius-s);
+  color: var(--iplan-paper);
+  background: var(--iplan-surface);
+}
+.iplan-planning-calendars > summary:hover { background: var(--iplan-wash); }
+.iplan-planning-calendars > summary:focus-visible,
+.iplan-planning-calendar-options input:focus-visible {
+  outline: 2px solid var(--iplan-marker);
+  outline-offset: 2px;
+}
+.iplan-planning-calendar-options {
+  position: absolute;
+  inset-inline-start: 0;
+  top: 100%;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  width: max-content;
+  max-width: 80vw;
+  max-height: 50vh;
+  overflow: auto;
+  padding: var(--size-4-3);
+  border: 1px solid var(--iplan-hairline);
+  border-radius: var(--radius-s);
+  background: var(--iplan-surface);
+  color: var(--iplan-paper);
+  box-shadow: var(--shadow-s);
+}
+.iplan-planning-calendars:not([open]) > .iplan-planning-calendar-options { display: none; }
+.iplan-planning-calendar-options .iplan-planning-filter { overflow-wrap: anywhere; }
+.iplan-planning-calendar-options input { flex-shrink: 0; }
+.iplan-planning-calendar-empty { color: var(--iplan-dim); }
+.iplan-planning-legend {
+  flex-basis: 100%;
+  color: var(--iplan-dim);
+  font-size: var(--font-ui-small);
+}
+.iplan-board.is-weekly-planning { align-items: stretch; }
+/* Use the daily metric hues with today's inset edge and existing day radius in either layout. */
+.iplan-board.is-weekly-planning .iplan-day {
+  background: var(--iplan-surface);
+  box-shadow: none;
+}
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='green'] {
+  box-shadow: inset 2px 0 0 var(--color-green);
+}
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='yellow'] {
+  box-shadow: inset 2px 0 0 var(--color-yellow);
+}
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='red'] {
+  box-shadow: inset 2px 0 0 var(--color-red);
+}
+.iplan-board.is-weekly-planning .iplan-day.is-past { opacity: 1; }
 /* past days: greyed but still a live drop target; hover lifts it back */
 .iplan-day.is-past {
   opacity: 0.55;
@@ -175,6 +246,19 @@ button.iplan-sync-btn.is-syncing svg {
 .iplan-day.is-past .iplan-day-date { color: var(--iplan-dim); }
 
 /* ------------------------------------------------------- timed grid ---- */
+.iplan-board.is-week-calendar .iplan-week-calendar-header-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.iplan-board.is-week-calendar .iplan-week-calendar-header {
+  flex-shrink: 0;
+}
+.iplan-board.is-week-calendar .iplan-time-scroll {
+  height: 72vh;
+  flex-shrink: 0;
+  overflow-anchor: none;
+}
 .iplan-time-scroll {
   position: relative;
   max-height: 72vh;
@@ -408,9 +492,6 @@ button.iplan-sync-btn.is-syncing svg {
 .iplan-daily-metric { display: flex; flex-direction: column; min-width: 0; }
 .iplan-daily-label { color: var(--iplan-dim); overflow-wrap: anywhere; }
 .iplan-daily-value { color: var(--iplan-paper); overflow-wrap: anywhere; }
-.iplan-daily-metric.is-meetings { border-top: 2px solid var(--color-red); }
-.iplan-daily-metric.is-planned { border-top: 2px solid var(--color-yellow); }
-.iplan-daily-metric.is-buffer { border-top: 2px solid var(--color-green); }
 .iplan-daily-warning { color: var(--iplan-dim); overflow-wrap: anywhere; }
 .iplan-daily-metric.is-overplanned .iplan-daily-value,
 .iplan-daily-metric.is-overplanned .iplan-daily-warning { color: var(--text-error, var(--color-red)); }

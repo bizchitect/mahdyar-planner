@@ -1829,7 +1829,7 @@ function dailyDurationText(minutes) {
   return `${minutes < 0 ? '-' : ''}${hours ? `${hours}h${remainder ? ' ' : ''}` : ''}${remainder || !hours ? `${remainder}m` : ''}`;
 }
 
-function renderDailyPlannedTime(parent, day, totals, calendars, stale) {
+function renderDailyPlannedTime(parent, day, totals, calendars, stale, showDiagnostics = true) {
   const summary = parent.createDiv({
     cls: 'iplan-daily-summary iplan-card-meta',
     attr: { role: 'group', 'aria-label': `Daily planned time for ${day}` },
@@ -1864,7 +1864,7 @@ function renderDailyPlannedTime(parent, day, totals, calendars, stale) {
   if (calendars.missing.length) warnings.push('Calendar data incomplete');
   else if (calendars.cached.length || stale) warnings.push('Calendar data cached');
   if ((calendars.warnings || []).length) warnings.push('Calendar feed warnings');
-  if (warnings.length) summary.createSpan({ cls: 'iplan-daily-warning', text: warnings.join('; ') });
+  if (showDiagnostics && warnings.length) summary.createSpan({ cls: 'iplan-daily-warning', text: warnings.join('; ') });
   return summary;
 }
 
@@ -11030,6 +11030,15 @@ class PlannerBoardView extends ItemView {
     this.routineExpanded = new Set();
     this.timedGrids = new Map();
     this.timeScrollPositions = new Map();
+    // Week Calendar has its own shared viewport; Day keeps its per-day cache.
+    this.weekTimeScrollPositions = new Map();
+    this.weekScrollTop = null;
+    this.weeklyPlanning = false;
+    this.showPlanningWeekends = false;
+    this.showPlanningRoutines = true;
+    this.showPlanningDailyRoutines = true;
+    this.showPlanningDetails = true;
+    this.hiddenPlanningCalendars = new Set();
   }
 
   getViewType() { return BOARD_VIEW_TYPE; }
@@ -11051,6 +11060,8 @@ class PlannerBoardView extends ItemView {
 
   async onClose() {
     this.routineViewClosed = true;
+    this.disposePlanningCalendars();
+    this.disposeWeekCalendarLayout();
     if (this.cancelDailyMove) this.cancelDailyMove();
     if (this.routineDetailModal) this.routineDetailModal.close();
     if (this.nowRailInterval != null) {
@@ -11062,7 +11073,105 @@ class PlannerBoardView extends ItemView {
 
   onResize() {
     if (this.routineViewClosed) return;
+    if (this.weekCalendarBoard) {
+      this.scheduleWeekCalendarLayout();
+      return;
+    }
     for (const day of this.timedGrids.keys()) this.relayoutTimedGrid(day);
+  }
+
+  disposePlanningCalendars() {
+    if (this.planningCalendarsCleanup) this.planningCalendarsCleanup();
+    this.planningCalendarsCleanup = null;
+  }
+
+  disposeWeekCalendarLayout() {
+    if (this.weekCalendarObserver) this.weekCalendarObserver.disconnect();
+    this.weekCalendarObserver = null;
+    if (this.weekCalendarFrame != null) this.weekCalendarWindow.cancelAnimationFrame(this.weekCalendarFrame);
+    this.weekCalendarFrame = null;
+    this.weekCalendarBoard = null;
+    this.weekCanvasHeight = null;
+  }
+
+  scheduleWeekCalendarLayout() {
+    if (!this.weekCalendarBoard || this.refreshingWeekCalendar || this.weekCalendarFrame != null) return;
+    this.weekCalendarFrame = this.weekCalendarWindow.requestAnimationFrame(() => {
+      this.weekCalendarFrame = null;
+      this.refreshWeekCalendarLayout();
+    });
+  }
+
+  setupWeekCalendarLayout(board) {
+    this.weekCalendarBoard = board;
+    this.weekCalendarWindow = board.ownerDocument.defaultView;
+    for (const grid of this.timedGrids.values()) {
+      const col = grid.scroll.parentElement;
+      const header = col.createDiv({ cls: 'iplan-week-calendar-header' });
+      const content = header.createDiv({ cls: 'iplan-week-calendar-header-content' });
+      // Include every pre-grid block, including today's countdown and overflow
+      // control. Equal column heights alone cannot align the actual grid tops.
+      while (col.firstElementChild !== grid.scroll) content.appendChild(col.firstElementChild);
+      col.insertBefore(header, grid.scroll);
+      grid.weekHeader = header;
+      grid.weekHeaderContent = content;
+    }
+    this.weekCalendarObserver = new this.weekCalendarWindow.ResizeObserver(() => this.scheduleWeekCalendarLayout());
+    this.weekCalendarObserver.observe(board);
+    for (const grid of this.timedGrids.values()) {
+      // Observe natural content, not the padded header, to allow shrink as well
+      // as growth without a min-height/observer feedback loop.
+      this.weekCalendarObserver.observe(grid.weekHeaderContent);
+      this.weekCalendarObserver.observe(grid.scroll);
+    }
+    this.refreshWeekCalendarLayout();
+  }
+
+  refreshWeekCalendarLayout() {
+    if (!this.weekCalendarBoard || !this.weekCalendarBoard.getClientRects().length) return;
+    this.refreshingWeekCalendar = true;
+    try {
+      const grids = [...this.timedGrids.values()];
+      for (const grid of grids) this.relayoutTimedGrid(grid.day);
+      const headerHeight = Math.max(0, ...grids.map((grid) => grid.weekHeaderContent.getBoundingClientRect().height));
+      // One local offset for every column also works when the board wraps into
+      // responsive rows. All columns in a row start their clocks together.
+      for (const grid of grids) grid.weekHeader.style.minHeight = `${headerHeight}px`;
+      const height = Math.max(0, ...grids.map((grid) => grid.contentHeight));
+      this.weekCanvasHeight = height;
+      for (const grid of grids) {
+        grid.slots.style.height = `${height}px`;
+        grid.canvas.style.height = `${height}px`;
+      }
+      if (!grids.length || grids.some((grid) => grid.scroll.clientHeight <= 0)) return;
+      if (this.weekScrollTop == null) {
+        const starts = grids.flatMap((grid) => (grid.workdayLabels || [])
+          .filter((marker) => marker.kind === 'start')
+          .map((marker) => Math.min(marker.anchor, marker.top, marker.titleTop ?? marker.top)));
+        this.weekScrollTop = starts.length ? Math.max(0, Math.min(...starts)) : 0;
+      }
+      this.syncWeekCalendarScroll(this.weekScrollTop);
+      this.updateNowRail();
+    } finally {
+      this.refreshingWeekCalendar = false;
+    }
+  }
+
+  syncWeekCalendarScroll(top) {
+    if (!this.weekCalendarBoard) return;
+    const grids = [...this.timedGrids.values()];
+    if (!grids.length || grids.some((grid) => grid.scroll.clientHeight <= 0)) return;
+    // Clamp once for the whole board, never independently at each day's end.
+    const maximum = Math.min(...grids.map((grid) => Math.max(0, grid.scroll.scrollHeight - grid.scroll.clientHeight)));
+    const target = Math.max(0, Math.min(top, maximum));
+    this.weekScrollTop = target;
+    for (const grid of grids) {
+      if (grid.scroll.scrollTop !== target) grid.scroll.scrollTop = target;
+      grid.lastScrollTop = grid.scroll.scrollTop;
+      grid.pendingSavedScrollTop = null;
+      grid.initialScrollPending = false;
+      this.weekTimeScrollPositions.set(grid.day, grid.lastScrollTop);
+    }
   }
 
   getState() { return { weekStart: this.weekStart, mode: this.mode, day: this.day, layout: this.layout }; }
@@ -11093,8 +11202,17 @@ class PlannerBoardView extends ItemView {
 
   render() {
     if (this.cancelDailyMove) this.cancelDailyMove();
+    this.disposeWeekCalendarLayout();
     const el = this.contentEl;
     const focusedElement = el.ownerDocument.activeElement;
+    const previousCalendars = el.querySelector('.iplan-planning-calendars');
+    const calendarsOpen = !!(previousCalendars && previousCalendars.open);
+    const calendarsScrollTop = previousCalendars
+      ? previousCalendars.querySelector('.iplan-planning-calendar-options').scrollTop : 0;
+    const planningFocus = this.pendingPlanningFocus ||
+      (previousCalendars && previousCalendars.contains(focusedElement)
+        ? focusedElement.getAttribute('data-planning-control') : null);
+    this.disposePlanningCalendars();
     const boardHadFocus = !!(focusedElement && el.contains(focusedElement) && focusedElement.closest('.iplan-board'));
     const planFocus = this.pendingPlanFocus || (boardHadFocus ? focusedElement.getAttribute('data-plan-focus') : null);
     el.dataset.layout = this.layout;
@@ -11107,13 +11225,17 @@ class PlannerBoardView extends ItemView {
     const today = todayStr();
     const isDay = this.mode === 'day';
     const isCalendar = this.layout === 'calendar';
+    const isWeeklyPlanning = this.weeklyPlanning && !isDay;
     const items = collectItems(this.plugin.app, this.plugin.paths().root);
     this.index = buildItemIndex(items);
     const splitHour = this.plugin.splitHour();
     const eventsWeekStart = isDay ? mondayOf(this.day) : this.weekStart;
-    const events = this.plugin.calendarDefs
+    const allEvents = this.plugin.calendarDefs
       ? icsEventsForWeek(this.plugin.calendarDefs, eventsWeekStart, splitHour)
       : [];
+    const events = isWeeklyPlanning
+      ? allEvents.filter((event) => !this.hiddenPlanningCalendars.has(event.feedId))
+      : allEvents;
     const capacityCalendars = dailyCapacityCalendars(this.plugin, eventsWeekStart, splitHour);
 
     /* ---- masthead ---- */
@@ -11142,6 +11264,17 @@ class PlannerBoardView extends ItemView {
     const layoutSeg = nav.createDiv({ cls: 'iplan-seg', attr: { 'aria-label': 'Layout' } });
     mkSeg(layoutSeg, 'OVERVIEW', 'overview', this.layout, (value) => this.setLayout(value));
     mkSeg(layoutSeg, 'CALENDAR', 'calendar', this.layout, (value) => this.setLayout(value));
+    const planningButton = nav.createEl('button', {
+      cls: 'iplan-seg-btn', text: 'WEEKLY PLANNING',
+      attr: { type: 'button', 'aria-pressed': String(isWeeklyPlanning), 'data-planning-control': 'mode' },
+    });
+    planningButton.toggleClass('is-active', isWeeklyPlanning);
+    planningButton.addEventListener('click', () => {
+      this.weeklyPlanning = !isWeeklyPlanning;
+      if (this.weeklyPlanning) this.mode = 'week';
+      this.pendingPlanningFocus = 'mode';
+      this.render();
+    });
     const mkNavBtn = (icon, label, fn) => {
       const b = nav.createEl('button', { cls: 'iplan-nav-btn', attr: { 'aria-label': label } });
       setIcon(b, icon);
@@ -11204,11 +11337,84 @@ class PlannerBoardView extends ItemView {
       for (const n of notices) bar.createDiv({ cls: 'iplan-notice', text: n });
     }
 
+    if (isWeeklyPlanning) {
+      const filters = el.createDiv({ cls: 'iplan-planning-filters', attr: {
+        role: 'group', 'aria-label': 'Weekly planning visibility',
+      } });
+      const visibility = (key, text, checked, change, detail, parent = filters) => {
+        const label = parent.createEl('label', { cls: 'iplan-planning-filter' });
+        const input = label.createEl('input', { attr: {
+          type: 'checkbox', 'data-planning-control': key, 'aria-label': text,
+        } });
+        input.checked = checked;
+        label.createSpan({ text });
+        if (detail) label.title = detail;
+        input.addEventListener('change', () => {
+          change(input.checked);
+          this.pendingPlanningFocus = key;
+          this.render();
+        });
+        return input;
+      };
+      visibility('weekends', 'Show weekends', this.showPlanningWeekends,
+        (checked) => { this.showPlanningWeekends = checked; });
+      visibility('routines', 'Show routines', this.showPlanningRoutines,
+        (checked) => { this.showPlanningRoutines = checked; });
+      const daily = visibility('daily-routines', 'Show daily routines', this.showPlanningDailyRoutines,
+        (checked) => { this.showPlanningDailyRoutines = checked; },
+        'Daily routines are scheduled Monday through Thursday or Monday through Friday.');
+      daily.disabled = !this.showPlanningRoutines;
+      visibility('details', 'Show details', this.showPlanningDetails,
+        (checked) => { this.showPlanningDetails = checked; });
+      // Native disclosure, like the setup guides, with independent checkboxes.
+      // Capture its DOM state before each render so a toggle keeps it usable.
+      const calendars = filters.createEl('details', { cls: 'iplan-planning-calendars' });
+      calendars.open = calendarsOpen;
+      const summary = calendars.createEl('summary', {
+        text: 'Calendars', attr: { 'data-planning-control': 'calendars' },
+      });
+      const options = calendars.createDiv({ cls: 'iplan-planning-calendar-options', attr: {
+        role: 'group', 'aria-label': 'Calendar visibility',
+      } });
+      const feeds = calendarFeeds(this.plugin.settings).filter((feed) => feed.enabled);
+      for (const feed of feeds) {
+        visibility(`calendar:${feed.id}`, feed.name, !this.hiddenPlanningCalendars.has(feed.id),
+          (checked) => {
+            if (checked) this.hiddenPlanningCalendars.delete(feed.id);
+            else this.hiddenPlanningCalendars.add(feed.id);
+          }, null, options);
+      }
+      if (!feeds.length) options.createDiv({ cls: 'iplan-planning-calendar-empty', text: 'No enabled calendars.' });
+      options.scrollTop = calendarsScrollTop;
+      const doc = el.ownerDocument;
+      const outside = (event) => {
+        if (calendars.open && !calendars.contains(event.target)) calendars.open = false;
+      };
+      const escape = (event) => {
+        if (event.key !== 'Escape' || !calendars.open) return;
+        event.preventDefault();
+        event.stopPropagation();
+        calendars.open = false;
+        summary.focus({ preventScroll: true });
+      };
+      doc.addEventListener('pointerdown', outside);
+      doc.addEventListener('keydown', escape);
+      this.planningCalendarsCleanup = () => {
+        doc.removeEventListener('pointerdown', outside);
+        doc.removeEventListener('keydown', escape);
+      };
+      filters.createDiv({ cls: 'iplan-planning-legend',
+        text: 'Buffer: green >40%, yellow 30-40%, red <30%. Hidden items still count. Visibility resets when this view closes.' });
+    }
+
     /* ---- board ---- */
     const visibleDays = isDay
       ? [this.day]
-      : weekDays(this.weekStart).filter((d, i) => this.plugin.settings.showWeekend || i < 5);
+      : weekDays(this.weekStart).filter((d, i) =>
+        (isWeeklyPlanning ? this.showPlanningWeekends : this.plugin.settings.showWeekend) || i < 5);
     const board = el.createDiv({ cls: 'iplan-board' });
+    if (isCalendar && !isDay) board.addClass('is-week-calendar');
+    if (isWeeklyPlanning) board.addClass('is-weekly-planning');
     if (isDay) board.addClass('is-day');
     board.style.setProperty('--iplan-day-count', String(visibleDays.length));
 
@@ -11240,8 +11446,21 @@ class PlannerBoardView extends ItemView {
 
       const capacityRoutines = routineOccurrences(this.plugin.routines || [], day,
         this.plugin.splitHM(), routineDefaultsOf(this.plugin.settings), this.plugin.settings._dailyPlanOverrides);
-      renderDailyPlannedTime(col, day, dailyPlannedTime(day, this.plugin.settings,
-        capacityCalendars.events, items, capacityRoutines), capacityCalendars, capacityCalendars.cached.length > 0);
+      const totals = dailyPlannedTime(day, this.plugin.settings,
+        capacityCalendars.events, items, capacityRoutines);
+      if (!isWeeklyPlanning || this.showPlanningDetails) {
+        renderDailyPlannedTime(col, day, totals, capacityCalendars,
+          capacityCalendars.cached.length > 0, !isWeeklyPlanning);
+      }
+      if (isWeeklyPlanning) {
+        // Use the computed ratio, not data-quality or assignment gates.
+        // Non-positive free capacity stays red even if its ratio is positive.
+        const level = totals.freeMin <= 0 ? 'red'
+          : totals.dayMin > 0 && Number.isFinite(totals.bufferPercent)
+            ? (totals.bufferPercent > 40 ? 'green' : totals.bufferPercent >= 30 ? 'yellow' : 'red')
+            : 'unknown';
+        col.dataset.buffer = level;
+      }
 
       const allDay = allDayByDay.get(day) || [];
       if (allDay.length) {
@@ -11254,7 +11473,15 @@ class PlannerBoardView extends ItemView {
         }
       }
 
-      const routines = this.plugin.routinesFor(day);
+      const routines = this.plugin.routinesFor(day).filter((occurrence) => {
+        if (!isWeeklyPlanning) return true;
+        if (!this.showPlanningRoutines) return false;
+        const weekdays = occurrence.routine.weekdays;
+        const daily = (weekdays.length === 4 || weekdays.length === 5)
+          && ['mon', 'tue', 'wed', 'thu'].every((code) => weekdays.includes(code))
+          && (weekdays.length === 4 || weekdays.includes('fri'));
+        return this.showPlanningDailyRoutines || !daily;
+      });
       if (isCalendar) {
         this.renderUntimedTasks(day, col, items);
         this.renderTimedGrid(day, col, items, events, routines);
@@ -11263,8 +11490,10 @@ class PlannerBoardView extends ItemView {
       }
 
       // Habits (2026-09-04): the day's all-day block under the afternoon lane.
-      const habitOccs = this.plugin.habitsFor(day, today);
-      if (habitOccs.length) col.appendChild(renderHabitsBlock(this.plugin, habitOccs, day, today, this));
+      if (!isWeeklyPlanning) {
+        const habitOccs = this.plugin.habitsFor(day, today);
+        if (habitOccs.length) col.appendChild(renderHabitsBlock(this.plugin, habitOccs, day, today, this));
+      }
 
       if (day === today) {
         this.renderNowIndicators(col, colHead, isCalendar ? this.timedGrids.get(day).slots : null);
@@ -11272,6 +11501,7 @@ class PlannerBoardView extends ItemView {
 
     }
     this.updateNowRail();
+    if (isCalendar && !isDay) this.setupWeekCalendarLayout(board);
 
     /* ---- foot: last sync stamp ---- */
     const foot = el.createDiv({ cls: 'iplan-foot' });
@@ -11286,6 +11516,11 @@ class PlannerBoardView extends ItemView {
       if (focus) focus.focus({ preventScroll: true });
     }
     this.pendingPlanFocus = null;
+    if (planningFocus) {
+      const control = el.querySelector(`[data-planning-control="${CSS.escape(planningFocus)}"]`);
+      if (control) control.focus({ preventScroll: true });
+    }
+    this.pendingPlanningFocus = null;
   }
 
   renderOverviewDay(day, col, items, events, routines) {
@@ -11432,9 +11667,10 @@ class PlannerBoardView extends ItemView {
       label.style.top = `${top}px`;
       hourLabels.push({ element: label, top });
     }
+    const isWeekCalendar = this.mode === 'week';
     const grid = { day, start: bounds.start, end: bounds.end, entries, slots, scroll, canvas, labelGutter, labelOverflow,
-      workdayLabels, hourLabels, initialScrollPending: !this.timeScrollPositions.has(day),
-      pendingSavedScrollTop: this.timeScrollPositions.has(day) ? this.timeScrollPositions.get(day) : null,
+      isWeekCalendar, workdayLabels, hourLabels, initialScrollPending: !isWeekCalendar && !this.timeScrollPositions.has(day),
+      pendingSavedScrollTop: !isWeekCalendar && this.timeScrollPositions.has(day) ? this.timeScrollPositions.get(day) : null,
       lastScrollTop: scroll.scrollTop };
     this.timedGrids.set(day, grid);
     if (labelOverflow) labelOverflow.addEventListener('click', () => {
@@ -11536,7 +11772,14 @@ class PlannerBoardView extends ItemView {
     }
 
     scroll.addEventListener('scroll', () => {
+      if (this.timedGrids.get(day) !== grid) return;
       if (!scroll.getClientRects().length) return;
+      if (grid.isWeekCalendar) {
+        // Programmatic peer events arrive asynchronously. Recording every
+        // peer's actual position above makes those events no-ops, not echoes.
+        if (scroll.scrollTop !== grid.lastScrollTop) this.syncWeekCalendarScroll(scroll.scrollTop);
+        return;
+      }
       if (scroll.scrollTop === grid.lastScrollTop
         && (grid.pendingSavedScrollTop != null || grid.initialScrollPending)) return;
       grid.lastScrollTop = scroll.scrollTop;
@@ -11681,7 +11924,7 @@ class PlannerBoardView extends ItemView {
       }
     }
     const layout = timedGridColumns(grid.entries);
-    let contentEnd = grid.end - grid.start;
+    let contentEnd = (grid.end - grid.start) * PLANNER_PIXELS_PER_MINUTE;
     for (const entry of layout) {
       const top = (entry.start - grid.start) * PLANNER_PIXELS_PER_MINUTE;
       entry.element.style.top = `${top}px`;
@@ -11690,8 +11933,13 @@ class PlannerBoardView extends ItemView {
       contentEnd = Math.max(contentEnd, top + entry.element.getBoundingClientRect().height);
     }
     const height = Math.ceil(contentEnd);
-    grid.slots.style.height = `${height}px`;
-    grid.canvas.style.height = `${height}px`;
+    grid.contentHeight = height;
+    // A single-day preview must not temporarily shorten its scroll range and
+    // clamp the board's shared position before the coalesced layout runs.
+    const canvasHeight = grid.isWeekCalendar ? Math.max(height, this.weekCanvasHeight || 0) : height;
+    grid.slots.style.height = `${canvasHeight}px`;
+    grid.canvas.style.height = `${canvasHeight}px`;
+    if (grid.isWeekCalendar) this.scheduleWeekCalendarLayout();
     const labels = grid.entries.filter((entry) => entry.shouldUseOutsideLabel && entry.labelElement).map((entry) => {
       entry.labelElement.hidden = false;
       const labelHeight = entry.labelElement.getBoundingClientRect().height;
