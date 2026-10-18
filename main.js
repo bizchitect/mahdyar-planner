@@ -1717,6 +1717,15 @@ function fmtOpenItems(count) {
   return count === 1 ? '1 OPEN ITEM' : `${count} OPEN ITEMS`;
 }
 
+// Outlook focus blocks stay visible on the calendar, but do not occupy
+// meeting capacity. The connector identity is independent of feed names/IDs;
+// generic ICS feeds do not identify their provider and must still count.
+function countsTowardCapacity(event) {
+  const title = trimmed(event && event.title).toLowerCase();
+  return !(title === 'blocked - focus time'
+    && event && event.feedSource === 'outlook-calendar');
+}
+
 function fmtLeft(mins) {
   const h = Math.floor(mins / 60);
   const m = mins % 60;
@@ -1740,7 +1749,8 @@ function dailyPlannedTime(day, settings, events, items, routines) {
   windowEnd.setMinutes(end);
   const meetingIntervals = [];
   for (const event of events || []) {
-    if ((event.day && event.day !== day) || (event.allDay && !event.continues)
+    if (!countsTowardCapacity(event)
+      || (event.day && event.day !== day) || (event.allDay && !event.continues)
       || !event.start || !event.end) continue;
     const eventStart = new Date(event.start).getTime();
     const eventEnd = new Date(event.end).getTime();
@@ -3956,6 +3966,7 @@ function icsEventsForWeek(defs, weekStart, splitHour) {
       const feedId = def.feedId || null;
       const feedName = def.feedName || null;
       const feedColor = def.feedColor ? clampSwatch(def.feedColor) : null;
+      const feedSource = def.feedSource || null;
       if (allDay) {
         // DTEND is exclusive for all-day events; emit one card per spanned day.
         const startDay = ov ? ov.start.day : occDay;
@@ -3969,7 +3980,7 @@ function icsEventsForWeek(defs, weekStart, splitHour) {
             start: null, end: null, allDay: true, day, half: null,
             location: eff.location, url: eff.url, conferenceUrl: eff.conferenceUrl || null, continues: i > 0,
             masterUid: def.uid, recurring, occStartUtc, tzUnresolved,
-            feedId, feedName, feedColor,
+            feedId, feedName, feedColor, feedSource,
           });
         }
       } else {
@@ -3988,7 +3999,7 @@ function icsEventsForWeek(defs, weekStart, splitHour) {
               half: first ? (effStart.getHours() < splitHour ? 'am' : 'pm') : null,
               location: eff.location, url: eff.url, conferenceUrl: eff.conferenceUrl || null, continues: !first,
               masterUid: def.uid, recurring, occStartUtc, tzUnresolved,
-              feedId, feedName, feedColor,
+              feedId, feedName, feedColor, feedSource,
             });
           }
           day = addDays(day, 1);
@@ -4127,13 +4138,15 @@ function calendarFeedFor(settings, ev) {
   return id ? calendarFeeds(settings).find((f) => f.id === id) || null : null;
 }
 
-// Stamp the feed's identity on every def a fetch returned. Id, name and
-// colour only: the URL stops here.
+// Stamp the feed's nonsecret identity and owning connector on every def.
+// Cache adoption also calls this, deriving the connector from current feed
+// metadata without changing the cache format. The URL stops here.
 function tagCalendarDefs(defs, feed) {
   for (const d of defs || []) {
     d.feedId = feed.id;
     d.feedName = feed.name;
     d.feedColor = clampSwatch(feed.color);
+    d.feedSource = calendarFeedConnector(feed.kind).id;
   }
   return defs;
 }
