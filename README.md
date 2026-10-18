@@ -71,6 +71,7 @@ The **tray** sits in the right sidebar with four tabs: unscheduled tasks,
 your calendar, your routines and your habits.
 
 In the daily **Calendar** view, **Today Backlog** sits to the left of the calendar.
+Its left edge uses the same buffer thresholds and colors as Weekly Planning.
 It lists unfinished tasks planned for the selected day that do not yet have
 a calendar time, initially in the weekly-planning sequence (morning before afternoon).
 Drag cards within Today Backlog to change that suggestion. An insertion line

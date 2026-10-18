@@ -11578,7 +11578,8 @@ class PlannerBoardView extends ItemView {
     if (isDay) board.addClass('is-day');
     if (isDay && isCalendar) board.addClass('is-day-calendar');
     board.style.setProperty('--iplan-day-count', String(visibleDays.length));
-    if (isDay && isCalendar) this.renderDayBacklog(this.day, board, items, events);
+    const dayBacklog = isDay && isCalendar
+      ? this.renderDayBacklog(this.day, board, items, events) : null;
 
     const allDayByDay = new Map();
     for (const ev of events) {
@@ -11614,14 +11615,15 @@ class PlannerBoardView extends ItemView {
         renderDailyPlannedTime(col, day, totals, capacityCalendars,
           capacityCalendars.cached.length > 0, !isWeeklyPlanning);
       }
-      if (isWeeklyPlanning) {
+      if (isWeeklyPlanning || dayBacklog) {
         // Use the computed ratio, not data-quality or assignment gates.
         // Non-positive free capacity stays red even if its ratio is positive.
         const level = totals.freeMin <= 0 ? 'red'
           : totals.dayMin > 0 && Number.isFinite(totals.bufferPercent)
             ? (totals.bufferPercent > 40 ? 'green' : totals.bufferPercent >= 30 ? 'yellow' : 'red')
             : 'unknown';
-        col.dataset.buffer = level;
+        if (isWeeklyPlanning) col.dataset.buffer = level;
+        if (dayBacklog) dayBacklog.dataset.buffer = level;
       }
 
       const allDay = allDayByDay.get(day) || [];
@@ -11910,6 +11912,7 @@ class PlannerBoardView extends ItemView {
         }
       });
     }
+    return section;
   }
 
   renderUntimedTasks(day, col, items) {

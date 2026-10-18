@@ -225,13 +225,16 @@ button.iplan-sync-btn.is-syncing svg {
   background: var(--iplan-surface);
   box-shadow: none;
 }
-.iplan-board.is-weekly-planning .iplan-day[data-buffer='green'] {
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='green'],
+.iplan-board.is-day-calendar .iplan-day-backlog[data-buffer='green'] {
   box-shadow: inset 2px 0 0 var(--color-green);
 }
-.iplan-board.is-weekly-planning .iplan-day[data-buffer='yellow'] {
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='yellow'],
+.iplan-board.is-day-calendar .iplan-day-backlog[data-buffer='yellow'] {
   box-shadow: inset 2px 0 0 var(--color-yellow);
 }
-.iplan-board.is-weekly-planning .iplan-day[data-buffer='red'] {
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='red'],
+.iplan-board.is-day-calendar .iplan-day-backlog[data-buffer='red'] {
   box-shadow: inset 2px 0 0 var(--color-red);
 }
 .iplan-board.is-weekly-planning .iplan-day.is-past { opacity: 1; }
