@@ -6,6 +6,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 Releases before 0.12.0 carry their notes on the GitHub release itself
 (the commit subjects since the previous tag).
 
+## [1.2.0] - 2026-10-18
+
+### Added
+- Weekly Planning mode in Overview and Calendar layouts, with independent
+  calendar visibility in a dropdown and separate routine visibility controls.
+- Weekends hidden by default in Weekly Planning, with an option to show them.
+- Optional daily Meetings, Planned and Buffer details. Habits are hidden in
+  Weekly Planning to keep the focus on available capacity.
+- Buffer-colored left edges: green above 40%, yellow from 30% through 40%,
+  and red below 30%. Hidden calendars and routines still count toward buffer.
+- Aligned weekly Calendar timelines with synchronized vertical scrolling.
+
+### Included from 1.1.1
+- Occurrence-only routine resizing in 15-minute steps, whole-routine dragging,
+  inside titles for blocks of 30 minutes or longer, and outside labels for
+  shorter routines.
+
 ## [1.1.0] - 2026-10-17
 
 ### Added
