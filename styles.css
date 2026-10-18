@@ -619,7 +619,7 @@ body.iplan-dragging .iplan-lane-empty { visibility: hidden; }
 .iplan-card:hover { border-color: var(--iplan-dim); }
 .iplan-card.is-dragging { opacity: 0.35; cursor: grabbing; }
 .iplan-card.is-goal {
-  border-color: color-mix(in srgb, var(--iplan-goal) 50%, transparent);
+  border-color: var(--iplan-goal);
   background: var(--iplan-goal-soft);
 }
 .iplan-card.is-done .iplan-card-title {
@@ -1464,6 +1464,7 @@ ul.iplan-settings-list li { margin: 3px 0; }
   outline: 2px solid var(--iplan-marker);
   outline-offset: -2px;
 }
+.iplan-day-backlog > .iplan-drop-line { flex-shrink: 0; }
 .iplan-day-backlog-title {
   margin: 0;
   font-size: inherit;

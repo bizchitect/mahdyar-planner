@@ -6,6 +6,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 Releases before 0.12.0 carry their notes on the GitHub release itself
 (the commit subjects since the previous tag).
 
+## [1.2.2] - 2026-10-18
+
+### Added
+- Label-derived Weekly Goals show matching tasks already available locally,
+  including completed matches, in gold cards. This is a live filter; it does
+  not fetch historical completed tasks.
+- Drag tasks from Weekly Backlog into Today Backlog. Today Backlog starts in
+  weekly-planning order, supports drop-position insertion and reordering, and
+  persists the order, including moves between its two halves.
+
 ## [1.2.1] - 2026-10-18
 
 ### Added

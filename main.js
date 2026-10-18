@@ -4791,10 +4791,10 @@ function itemFromFrontmatter(fm, path, basename) {
     plannedDuration: Number.isInteger(fm.planned_duration) ? fm.planned_duration : null,
     plannedOccurrenceDue: fm.planned_occurrence_due ? String(fm.planned_occurrence_due).slice(0, 10) : null,
     doneLocal: fm.done_local === true,
-    // `weekly_goal` is the key; "pinned to the week" is what it MEANS and
-    // what every surface says since 0.14.0. The key is not renamed: a
-    // plugin-written field name is a migration, a label is not.
-    weeklyGoal: fm.weekly_goal === true,
+    // Derived from the exact Todoist label, never the legacy local flag.
+    // Keep old `weekly_goal` frontmatter intact but inert.
+    weeklyGoal: fm.source === 'todoist'
+      && Array.isArray(fm.tags) && fm.tags.includes('weekly-goal'),
     // The note this task is for (0.14.0). Plan-owned: no sync run reads it,
     // writes it or clears it. Two readings, because there are two questions:
     // `linkedNote` is what to CALL it (the menu says "Open chaser", not
@@ -6941,10 +6941,9 @@ function nowRailEventPosition(nowMs, events, workday) {
  *                     confirmed in the evening. Heading "## Daily
  *                     highlights", sentinel daily-highlights.
  *
- * Neither is a Goal. A Goal is the note in My Life, and that word stays
- * there. The starred planner item is neither either: it is a task PINNED to
- * the week, and its frontmatter key (`weekly_goal`) is unchanged because a
- * key a plugin has already written under is a migration and a label is not.
+ * These week-note outcomes are separate from Weekly Goals in the tray,
+ * which are tasks carrying Todoist's exact `weekly-goal` label. The legacy
+ * `weekly_goal` frontmatter is retained but no longer controls the UI.
  *
  * What the plugin may write in this note: the two sentinel blocks, and the
  * `week` field when the note is created. Nothing else. Everything a person
@@ -8768,15 +8767,26 @@ class IcorPlannerPlugin extends Plugin {
     this._shadowSaveTimer = window.setTimeout(() => this.persistSettings(), 1500);
   }
 
-  async assignItem(path, day, half, order) {
+  async assignItem(path, day, half, order, untimed = false) {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
+    if (!(file instanceof TFile)) return false;
     await this.app.fileManager.processFrontMatter(file, (fm) => {
+      if (untimed) {
+        // This entry point only takes unplanned backlog tasks. Recheck the
+        // actual note so a stale drag cannot overwrite a newer plan or done.
+        const current = itemFromFrontmatter(fm, path, file.basename);
+        if (!validPlannerDay(day) || !current || isDone(current) || current.plannedDay) {
+          throw new Error('Task is no longer an unfinished, unplanned backlog item.');
+        }
+        delete fm.planned_start;
+        delete fm.planned_occurrence_due;
+      }
       fm.planned_day = day;
       fm.planned_half = half;
       fm.planned_order = order;
       this.claimTodoistDuration(fm);
     });
+    return true;
   }
 
   async assignTimedItem(path, day, start, duration, item) {
@@ -8815,6 +8825,103 @@ class IcorPlannerPlugin extends Plugin {
       console.error('icor-planner: could not schedule task', path, error);
       new Notice('Planner: the task could not be scheduled. Check the task note and try again.');
       return false;
+    }
+    this.emitModelChanged();
+    return true;
+  }
+
+  async placeInDayBacklog(path, day, half, order, expected, reranks = [], snapshot = []) {
+    if (this._dayBacklogSaving) {
+      new Notice('Planner: another Today Backlog save is still in progress. Try again when it finishes.');
+      return false;
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      new Notice('Planner: the task note could not be found. Refresh the view before planning it.');
+      return false;
+    }
+    const placementKeys = ['source', 'id', 'plannedDay', 'plannedHalf', 'plannedOrder',
+      'plannedStart', 'plannedDuration', 'plannedOccurrenceDue', 'due', 'status', 'doneLocal'];
+    const samePlacement = (a, b) => a && b && placementKeys.every((key) => a[key] === b[key]);
+    // Guard the whole target day's membership, not just the two neighbours.
+    // mtime also catches edits whose metadata-cache update has not arrived.
+    const stamps = new Map();
+    for (const task of snapshot) {
+      const note = this.app.vault.getAbstractFileByPath(task.path);
+      if (!(note instanceof TFile)) {
+        new Notice('Planner: Today Backlog changed. Refresh the view and try again.');
+        return false;
+      }
+      stamps.set(task.path, { file: note, mtime: note.stat.mtime, size: note.stat.size });
+    }
+    const saved = new Map();
+    const guardMembership = () => {
+      const fresh = collectItems(this.app, this.paths().root);
+      const members = fresh.filter((task) => task.plannedDay === day || task.path === path);
+      if (members.length !== snapshot.length || snapshot.some((task) => {
+        const current = members.find((candidate) => candidate.path === task.path);
+        const stamp = stamps.get(task.path);
+        const note = this.app.vault.getAbstractFileByPath(task.path);
+        return !current || !stamp || note !== stamp.file
+          || note.stat.mtime !== stamp.mtime || note.stat.size !== stamp.size
+          // Our own just-saved notes can still have their old cache entry.
+          || (!samePlacement(current, task) && !samePlacement(current, saved.get(task.path)));
+      })) throw new Error('Today Backlog membership or placement changed. Refresh before trying again.');
+    };
+    let written = 0;
+    this._dayBacklogSaving = true;
+    try {
+      guardMembership();
+      // Peers first, dragged task last. These are guarded per-file writes,
+      // NOT an atomic transaction. Do not roll back over a concurrent edit.
+      for (const change of reranks) {
+        guardMembership();
+        const peer = stamps.get(change.item.path);
+        if (!peer || change.item.path === path || change.item.plannedDay !== day
+          || change.item.plannedHalf !== half
+          || activeTimedPlacement(change.item) || !Number.isFinite(change.order)) {
+          throw new Error('Invalid Today Backlog normalization target.');
+        }
+        await this.app.fileManager.processFrontMatter(peer.file, (fm) => {
+          guardMembership();
+          const current = itemFromFrontmatter(fm, peer.file.path, peer.file.basename);
+          if (!samePlacement(current, change.item)) {
+            throw new Error('A task changed before its order could be normalized.');
+          }
+          fm.planned_order = change.order;
+        });
+        written++;
+        saved.set(change.item.path, { ...change.item, plannedOrder: change.order });
+        peer.mtime = peer.file.stat.mtime;
+        peer.size = peer.file.stat.size;
+      }
+      guardMembership();
+      await this.app.fileManager.processFrontMatter(file, (fm) => {
+        guardMembership();
+        const current = itemFromFrontmatter(fm, path, file.basename);
+        // Check again inside the write, not just against the rendered card.
+        // A stale drag must not move a newer plan or reopen a completed task.
+        if (!validPlannerDay(day) || !current || isDone(current) || !expected
+          || (current.plannedDay && current.plannedDay !== day)
+          || !samePlacement(current, expected)
+          || !['am', 'pm'].includes(half) || !Number.isFinite(order)) {
+          throw new Error('Task changed while dragging. Refresh before trying again.');
+        }
+        fm.planned_day = day;
+        fm.planned_half = half;
+        fm.planned_order = order;
+        delete fm.planned_start;
+        delete fm.planned_occurrence_due;
+        this.claimTodoistDuration(fm);
+      });
+    } catch (error) {
+      console.error('icor-planner: could not place task in Today Backlog', path, error);
+      new Notice(written
+        ? `Planner: the move did not finish after normalizing ${written} task note(s). Some order ranks were saved; this is not an atomic save. Refresh and retry the move.`
+        : 'Planner: the task could not be placed in Today Backlog. Check the task note, refresh the view and try again.');
+      return false;
+    } finally {
+      this._dayBacklogSaving = false;
     }
     this.emitModelChanged();
     return true;
@@ -8888,14 +8995,6 @@ class IcorPlannerPlugin extends Plugin {
       if (decision === 'push') fm.reopen_pending = true;
     });
     return true;
-  }
-
-  async toggleWeeklyGoal(path) {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) return;
-    await this.app.fileManager.processFrontMatter(file, (fm) => {
-      fm.weekly_goal = fm.weekly_goal !== true;
-    });
   }
 
   // The note this task is FOR (0.14.0). Plan-owned: written only here and
@@ -9577,10 +9676,7 @@ function cardChips(item, today, ghost) {
     });
   }
   if (item.priority <= 2) out.push({ kind: 'priority', cls: `iplan-chip iplan-prio-${item.priority}`, text: `P${item.priority}` });
-  // The chip says WEEK, not GOAL (ruling 2026-09-15): the star pins a task
-  // to the week, and the word "goal" belongs to the My Life note. `kind` and
-  // the CSS class keep their names - they are keys, not labels.
-  if (item.weeklyGoal) out.push({ kind: 'goal', cls: 'iplan-chip iplan-goal-chip', text: 'WEEK' });
+  if (item.weeklyGoal) out.push({ kind: 'goal', cls: 'iplan-chip iplan-goal-chip', text: 'WEEKLY GOAL' });
   if (item.recurring === true) {
     out.push({
       kind: 'repeat', cls: 'iplan-chip iplan-repeat-chip', text: '', icon: 'repeat',
@@ -10124,8 +10220,6 @@ function showCardMenu(plugin, item, view, pos) {
   const menu = new Menu();
   menu.addItem((mi) => mi.setTitle(isDone(item) ? 'Reopen' : 'Mark done')
     .setIcon('check').onClick(() => plugin.toggleDoneLocal(item.path)));
-  menu.addItem((mi) => mi.setTitle(item.weeklyGoal ? 'Unpin from this week' : 'Pin to this week')
-    .setIcon('star').onClick(() => plugin.toggleWeeklyGoal(item.path)));
   // The note this task is for: plan-owned, and the only place it is edited
   // from. Two rows, never one that changes meaning with the state.
   menu.addItem((mi) => mi.setTitle(item.linkedNote ? 'Change the linked note' : 'Link a note')
@@ -10191,13 +10285,15 @@ function showPlanMenu(plugin, item, view, pos) {
 // task cards in DOM order (the same order laneSequence() rendered them in), so
 // a task can be dropped above, between or below calendar events. Event chips
 // are never draggable; they only take part as positions.
-function wireDropLane(laneEl, onDrop) {
+// Today Backlog supplies a direct-child selector so expanded subtasks do not
+// count as extra insertion positions.
+function wireDropLane(laneEl, onDrop, cardSelector = '.iplan-event, .iplan-card.iplan-routine, .iplan-card:not(.is-dragging):not(.is-ghost)') {
   const clearLine = () => laneEl.querySelectorAll('.iplan-drop-line').forEach((el) => el.remove());
   // Ghost cards (finished occurrences) sit after the live sequence and take
   // no part in it, so they are excluded here exactly as they are excluded
   // from the sequence the drop handler ranks over. A routine block IS in the
   // sequence, skipped (ghost) or not, so it is a position like an event chip.
-  const cardsOf = () => Array.from(laneEl.querySelectorAll('.iplan-event, .iplan-card.iplan-routine, .iplan-card:not(.is-dragging):not(.is-ghost)'));
+  const cardsOf = () => Array.from(laneEl.querySelectorAll(cardSelector));
   const indexForY = (y) => {
     const cards = cardsOf();
     for (let i = 0; i < cards.length; i++) {
@@ -10207,6 +10303,7 @@ function wireDropLane(laneEl, onDrop) {
     return cards.length;
   };
   laneEl.addEventListener('dragover', (e) => {
+    if (!Array.from(e.dataTransfer.types).includes('text/plain')) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     laneEl.classList.add('is-drop-target');
@@ -11481,7 +11578,7 @@ class PlannerBoardView extends ItemView {
     if (isDay) board.addClass('is-day');
     if (isDay && isCalendar) board.addClass('is-day-calendar');
     board.style.setProperty('--iplan-day-count', String(visibleDays.length));
-    if (isDay && isCalendar) this.renderDayBacklog(this.day, board, items);
+    if (isDay && isCalendar) this.renderDayBacklog(this.day, board, items, events);
 
     const allDayByDay = new Map();
     for (const ev of events) {
@@ -11641,36 +11738,147 @@ class PlannerBoardView extends ItemView {
     }
   }
 
-  renderDayBacklog(day, board, items) {
-    const tasks = items.filter((item) => item.plannedDay === day
-      && !item.ghost && !isDone(item) && !activeTimedPlacement(item));
-    const halfRank = { am: 0, pm: 1 };
-    tasks.sort((a, b) => ((halfRank[a.plannedHalf] ?? 2) - (halfRank[b.plannedHalf] ?? 2))
-      || a.plannedOrder - b.plannedOrder);
+  renderDayBacklog(day, board, items, events) {
+    const tasks = items.filter((item) => isDayBacklogItem(item, day)).sort(compareDayBacklogItems);
     const section = board.createEl('section', { cls: 'iplan-day iplan-day-backlog',
       attr: { 'aria-label': `Today Backlog for ${day}` } });
-    section.addEventListener('dragover', (event) => {
-      if (!Array.from(event.dataTransfer.types).includes('text/plain')) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'move';
-      section.addClass('is-drop-target');
-    });
-    section.addEventListener('dragleave', (event) => {
-      if (!section.contains(event.relatedTarget)) section.removeClass('is-drop-target');
-    });
-    section.addEventListener('drop', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      section.removeClass('is-drop-target');
-      const path = event.dataTransfer.getData('text/plain');
-      const item = items.find((candidate) => candidate.path === path);
-      if (!item || item.ghost || isDone(item) || item.plannedDay !== day) {
-        new Notice('Planner: drop an unfinished task planned for this date into Today Backlog.');
+    wireDropLane(section, async (path, index) => {
+      const currentItems = collectItems(this.plugin.app, this.plugin.paths().root);
+      const item = currentItems.find((candidate) => candidate.path === path);
+      if (!validPlannerDay(day) || !item || item.ghost || isDone(item)
+        || (item.plannedDay && item.plannedDay !== day)) {
+        new Notice('Planner: drop an unfinished Weekly Backlog task or a task planned for this date into Today Backlog.');
         return;
       }
-      if (!activeTimedPlacement(item)) return;
-      this.plugin.unassignItem(path, true);
-    });
+      const siblings = tasks.filter((task) => task.path !== path);
+      // The DOM index excludes the dragged card. Refuse an outdated target
+      // sequence rather than silently inserting relative to moved/done cards.
+      const currentTasks = currentItems.filter((task) => isDayBacklogItem(task, day) && task.path !== path);
+      if (currentTasks.length !== siblings.length || siblings.some((task) => {
+        const fresh = currentTasks.find((candidate) => candidate.path === task.path);
+        return !fresh || fresh.plannedHalf !== task.plannedHalf || fresh.plannedOrder !== task.plannedOrder;
+      })) {
+        new Notice('Planner: Today Backlog changed while dragging. Refresh the view and try again.');
+        return;
+      }
+      const originalIndex = tasks.findIndex((task) => task.path === path);
+      const rendered = tasks[originalIndex];
+      if (rendered && (rendered.plannedHalf !== item.plannedHalf
+        || rendered.plannedOrder !== item.plannedOrder || activeTimedPlacement(item))) {
+        new Notice('Planner: the task changed while dragging. Refresh the view and try again.');
+        return;
+      }
+      // The DOM insertion index already excludes this card. Re-inserting at
+      // its original index preserves its lane, even at an AM/PM boundary.
+      // Return BEFORE rank allocation or processFrontMatter, including a
+      // single card with rank zero and first/middle/last self-drops.
+      if (originalIndex >= 0 && originalIndex === index) return;
+      const before = siblings[index - 1];
+      const after = siblings[index];
+      // Before the next task is unambiguous, including at the AM/PM boundary.
+      // At the end use the preceding task's half. This changes the lane when
+      // needed so half-first sorting cannot undo the requested daily move.
+      const anchor = after || before;
+      const start = plannedStartMinute(item.plannedStart);
+      const half = anchor ? anchor.plannedHalf
+        : item.plannedHalf || (start == null ? 'am' : routineHalf(start, this.plugin.splitHM()));
+      // Build the ranking lane from EVERY visible backlog member, not the
+      // agenda's narrower untimed predicate. Remove those members from the
+      // agenda input first so stale/incomplete timed notes appear exactly once.
+      const agenda = agendaSections(currentItems.filter((task) => task.path !== path
+        && !isDayBacklogItem(task, day)),
+        events, day, this.plugin.routinesFor(day), this.plugin.splitHM());
+      const sequence = agenda[half] && agenda[half].concat(currentTasks
+        .filter((task) => task.plannedHalf === half)
+        .map((it) => ({ kind: 'task', it, path: it.path, plannedOrder: it.plannedOrder })))
+        .sort((a, b) => (a.plannedOrder - b.plannedOrder)
+          || (LANE_KIND_RANK[a.kind] - LANE_KIND_RANK[b.kind]));
+      const targetIndex = after && sequence
+        ? sequence.findIndex((entry) => entry.kind === 'task' && entry.path === after.path)
+        : sequence ? sequence.length : -1;
+      if (targetIndex < 0) {
+        new Notice('Planner: the target task has no valid weekly lane. Place it in morning or afternoon first, then try again.');
+        return;
+      }
+      let order = this.plugin.orderForInsert(sequence, targetIndex);
+      const fits = (rank) => Number.isFinite(rank)
+        && (!before || before.plannedHalf !== half || rank > before.plannedOrder)
+        && (!after || after.plannedHalf !== half || rank < after.plannedOrder);
+      if (!fits(order)) {
+        // A hidden event/routine may share the next task's rank. The visible
+        // task position takes precedence over that hidden mixed-lane slot.
+        const neighbours = [before, after].filter((task) => task && task.plannedHalf === half);
+        order = this.plugin.orderForInsert(neighbours,
+          before && before.plannedHalf === half ? 1 : 0);
+      }
+      let reranks = [];
+      if (!fits(order)) {
+        // Completed untimed notes also carry local hand ranks. Include them
+        // in this block so common zero defaults do not become artificial
+        // fixed barriers; only their order may change, never completion.
+        const movable = new Map(currentItems.filter((task) => task.path !== path
+          && !task.ghost && task.plannedHalf === half
+          && (isDayBacklogItem(task, day) || isUntimedHalfDayItem(task, day)))
+          .map((task) => [task.path, task]));
+        // Keep the mixed sequence, including immutable event/routine and
+        // timed-task anchors. Only spread the contiguous movable
+        // block containing the insertion. Other blocks and days are untouched.
+        const normalized = sequence.slice();
+        normalized.splice(targetIndex, 0, { kind: 'task', path, it: item });
+        const canRank = (entry) => entry.kind === 'task'
+          && (entry.path === path || movable.has(entry.path));
+        let first = targetIndex;
+        let last = targetIndex;
+        while (first > 0 && canRank(normalized[first - 1])) first--;
+        while (last + 1 < normalized.length && canRank(normalized[last + 1])) last++;
+        const count = last - first + 1;
+        const left = first > 0 ? normalized[first - 1].plannedOrder : null;
+        const right = last + 1 < normalized.length ? normalized[last + 1].plannedOrder : null;
+        const ranks = [];
+        for (let n = 1; n <= count; n++) {
+          // Fixed time anchors use minute ranks. Weighted interpolation avoids
+          // overflow; unbounded ends use the existing ten-point spacing.
+          const rank = left == null && right == null ? n * 10
+            : left == null ? right - (count - n + 1) * 10
+            : right == null ? left + n * 10
+            : left * (1 - n / (count + 1)) + right * (n / (count + 1));
+          ranks.push(rank);
+        }
+        if (ranks.some((rank, n) => !Number.isFinite(rank)
+          || (n ? rank <= ranks[n - 1] : left != null && rank <= left)
+          || (right != null && rank >= right))) {
+          new Notice('Planner: fixed calendar/task anchors leave no representable order space. No ranks were saved. Refresh and move the task to another position.');
+          return;
+        }
+        for (let n = 0; n < count; n++) {
+          const entry = normalized[first + n];
+          if (entry.path === path) order = ranks[n];
+          else if (entry.plannedOrder !== ranks[n]) {
+            reranks.push({ item: movable.get(entry.path), order: ranks[n] });
+          }
+        }
+      }
+      // Project the exact renderer predicate and sort BEFORE any note writes.
+      // Check all members and lanes, not just the dragged card's neighbours:
+      // reranking must never silently reorder any undragged visible peer.
+      const rankChanges = new Map(reranks.map((change) => [change.item.path, change.order]));
+      const projected = currentItems.map((task) => task.path === path
+        ? { ...task, plannedDay: day, plannedHalf: half, plannedOrder: order,
+          plannedStart: null, plannedOccurrenceDue: null }
+        : rankChanges.has(task.path) ? { ...task, plannedOrder: rankChanges.get(task.path) } : task)
+        .filter((task) => isDayBacklogItem(task, day)).sort(compareDayBacklogItems);
+      const requested = siblings.slice();
+      requested.splice(index, 0, { ...item, plannedHalf: half });
+      if (!Number.isFinite(order) || projected.length !== requested.length
+        || projected.some((task, n) => task.path !== requested[n].path
+          || task.plannedHalf !== requested[n].plannedHalf)) {
+        new Notice('Planner: the requested Today Backlog order and lanes cannot be preserved with these ranks and fixed anchors. No ranks were saved. Refresh and move the task to another position.');
+        return;
+      }
+      await this.plugin.placeInDayBacklog(path, day, half, order, item, reranks,
+        currentItems.filter((task) => task.plannedDay === day || task.path === path));
+    }, ':scope > .iplan-card:not(.is-dragging):not(.is-ghost)');
+    section.addEventListener('drop', (event) => event.stopPropagation());
     const head = section.createDiv({ cls: 'iplan-day-head' });
     head.createEl('h2', { cls: 'iplan-day-backlog-title', text: 'Today Backlog' });
     for (const item of tasks) {
@@ -12190,7 +12398,7 @@ class PlannerBoardView extends ItemView {
 
 /* ========================================================================== *
  * Tray view - the right-panel companion, tabbed since 0.6.0:
- *   TASKS  - the week's pinned tasks + unscheduled items by source (the classic
+ *   TASKS  - Weekly Goals + unscheduled items by source (the classic
  *            tray; whole-panel drop unassigns). Internal id 'sync' (pre-0.6.1
  *            name, kept so no state migration is needed). Since 0.6.1 this
  *            tab ONLY exists while the planner board is the context
@@ -12203,8 +12411,8 @@ class PlannerBoardView extends ItemView {
  *            month, its status and a menu (rename, pause, archive, delete,
  *            open); New habit and Import from My Life on the section head.
  *            Board context only, like TASKS.
- *   PINNED - only the tasks pinned to this week (tab id 'goals', label
- *            PINNED, section head PINNED THIS WEEK).
+ *   WEEKLY GOALS - qualifying Todoist tasks with the exact weekly-goal label,
+ *            including completed local matches (tab id 'goals').
  * Default follows context (trayDefaultTab): board active -> TASKS, any other
  * main-area page -> AGENDA. A manual pick sticks until the context flips.
  * ========================================================================== */
@@ -12215,13 +12423,13 @@ const BOARD_ONLY_TABS = ['sync', 'habits'];
 
 // Tom's default rule: with the planner board active the tray assists planning
 // (SYNC); on every other page it answers "what is planned today" (AGENDA).
-// PINNED is never a default anywhere.
+// Weekly Goals is never a default anywhere.
 function trayDefaultTab(contextIsBoard) {
   return contextIsBoard ? 'sync' : 'agenda';
 }
 
 // 0.6.1, Tom's rule: "your tasks" (the TASKS tab) should only show on the
-// planner page; on all other pages only AGENDA and PINNED exist. Pure helper
+// planner page; on all other pages only AGENDA and Weekly Goals exist. Pure helper
 // so render() and setTab() share one source of truth.
 function trayVisibleTabs(contextIsBoard) {
   return contextIsBoard ? TRAY_TABS : TRAY_TABS.filter((t) => !BOARD_ONLY_TABS.includes(t));
@@ -12232,16 +12440,13 @@ function trayVisibleTabs(contextIsBoard) {
 // wired to it needs a migration.
 function trayTabLabel(tab) {
   if (tab === 'sync') return 'TASKS';
-  // 'goals' renders as PINNED since 0.14.0: the tab lists tasks pinned to the
-  // week, and "Goal" is the My Life note's word (ruling 2026-09-15). The id
-  // stays 'goals' so nothing persisted or wired to it needs a migration, the
-  // same reason 'sync' still renders as TASKS.
-  if (tab === 'goals') return 'PINNED';
+  // Keep the existing id; membership is derived, not persisted.
+  if (tab === 'goals') return 'WEEKLY GOALS';
   return tab.toUpperCase();
 }
 
-// The tray section head, and the whole surface's name for the starred task.
-const PINNED_SECTION_HEAD = 'PINNED THIS WEEK';
+// Keep the internal constant name for existing consumers; no pin UI remains.
+const PINNED_SECTION_HEAD = 'WEEKLY GOALS';
 // The spoken name of a tab (the label is uppercase for the eye only).
 function trayTabName(tab) {
   const l = trayTabLabel(tab);
@@ -12312,8 +12517,8 @@ function trayEmptyState(source, configured, status, count, total, secretsElsewhe
   // the tray said "nothing added yet", denying a task that exists. The list
   // under a source head is the UNSCHEDULED list, so its empty copy states
   // that ("nothing unscheduled", the same vocabulary as the synced sections)
-  // and never where the items went - a done-but-unscheduled item and a pinned
-  // pinned to the week both empty this list without being on the board.
+  // and never where the items went. Completed tasks and Weekly Goals can
+  // both leave this list empty without being on the board.
   if (source === MANUAL_SOURCE) {
     if (count > 0) return null;
     const everAdded = (total || 0) > 0;
@@ -12375,6 +12580,19 @@ function trayRevealDecision(state) {
 
 function trayRevealSpendsTurn(decision) {
   return decision === 'create-and-reveal' || decision === 'reveal';
+}
+
+// Today Backlog rendering and rank projection must use identical membership
+// and ordering, including stale/incomplete timed notes with no active placement.
+function isDayBacklogItem(item, day) {
+  return !!item && item.plannedDay === day
+    && !item.ghost && !isDone(item) && !activeTimedPlacement(item);
+}
+
+function compareDayBacklogItems(a, b) {
+  const halfRank = { am: 0, pm: 1 };
+  return ((halfRank[a.plannedHalf] ?? 2) - (halfRank[b.plannedHalf] ?? 2))
+    || a.plannedOrder - b.plannedOrder;
 }
 
 // The read-only agenda keeps its half-based list, deriving a timed task's
@@ -12450,7 +12668,7 @@ class PlannerTrayView extends ItemView {
     // Whole-panel unassign drop target, wired ONCE on the persistent
     // contentEl (empty() clears children, not the element's own listeners -
     // wiring inside render() stacked a duplicate set per re-render). Guarded
-    // to the SYNC tab: AGENDA and PINNED are read-plus-click surfaces.
+    // to the SYNC tab: AGENDA and Weekly Goals are read-plus-click surfaces.
     const el = this.contentEl;
     el.addEventListener('dragover', (e) => {
       if (this.activeTab !== 'sync') return;
@@ -12821,14 +13039,14 @@ class PlannerTrayView extends ItemView {
     }
   }
 
-  /* ---- PINNED: only the tasks pinned to this week ---- */
+  /* ---- Weekly Goals: label matches within the existing tray filter ---- */
   renderGoals(el, items) {
-    const goals = items.filter((i) => i.weeklyGoal && !isDone(i));
+    const goals = items.filter((i) => i.weeklyGoal);
     const sec = el.createDiv({ cls: 'iplan-tray-section' });
     sec.createDiv({ cls: 'iplan-tray-section-head', text: PINNED_SECTION_HEAD });
     const body = sec.createDiv({ cls: 'iplan-tray-section-body' });
     if (!goals.length) {
-      body.createDiv({ cls: 'iplan-tray-note', text: 'Nothing pinned to this week yet. Pin one from a card’s menu.' });
+      body.createDiv({ cls: 'iplan-tray-note', text: 'No Weekly Goals match the backlog filter. Add the weekly-goal label in Todoist to a task tagged this-week or due this week, then sync.' });
     }
     for (const g of goals) body.appendChild(renderCard(this.plugin, g, 'tray', this));
   }
@@ -12922,7 +13140,7 @@ class PlannerTrayView extends ItemView {
     }
   }
 
-  /* ---- SYNC: the classic tray (goals pinned + unscheduled by source) ---- */
+  /* ---- SYNC: the classic tray (Weekly Goals + unscheduled by source) ---- */
   renderSync(el, items, today) {
     const resolved = this.plugin.withSecrets();
     const conn = trayConnectionState(resolved);
@@ -12944,8 +13162,8 @@ class PlannerTrayView extends ItemView {
       cta.addEventListener('click', () => this.plugin.openPluginSettings());
     }
 
-    /* ---- the week's pinned tasks, on top of the lists ---- */
-    const goals = items.filter((i) => i.weeklyGoal && !isDone(i));
+    /* ---- Weekly Goals, including completed local matches, above the lists ---- */
+    const goals = items.filter((i) => i.weeklyGoal);
     if (goals.length) {
       const sec = el.createDiv({ cls: 'iplan-tray-section' });
       sec.createDiv({ cls: 'iplan-tray-section-head', text: PINNED_SECTION_HEAD });
