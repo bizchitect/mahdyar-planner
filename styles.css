@@ -703,6 +703,8 @@ body.iplan-dragging .iplan-lane-empty { visibility: hidden; }
   color: var(--iplan-dim);
   white-space: nowrap;
 }
+.iplan-duration-chip { flex: 0 0 auto; text-transform: none; }
+.iplan-duration-chip.is-missing { border-style: dotted; }
 .iplan-chip.iplan-due-overdue {
   color: var(--iplan-overdue);
   border-color: color-mix(in srgb, var(--iplan-overdue) 55%, transparent);

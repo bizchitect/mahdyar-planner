@@ -131,10 +131,22 @@ actions do not change the task's source due date or completion.
 Task cards show their source icon on the right of the title. The checkbox,
 title and icon share a vertically centered row, including on longer tasks.
 Todoist icons use a red tile with white lines throughout the planner.
+Todoist task cards also show a duration chip beside the title in Weekly Backlog,
+Today Backlog, scheduled Calendar tasks and the other shared task-card views.
+The chip shows the last-synced Todoist estimate in minutes below 60 minutes and
+in decimal hours at 60 minutes or more (for example, 90 minutes shows **1.5 h**),
+including estimates entered as hours in Todoist. Hour values are rounded to at
+most two decimal places. Missing estimates show **? min** with a dotted outline
+and a **Duration not set** tooltip and accessible label. Before a duration baseline
+has been synced, the chip also stays unknown rather than guessing from a calendar
+block. The one-hour scheduling fallback is not a source estimate. Calendar
+resizing still changes the local block duration, not the Todoist estimate.
+Calendar events and routine cards do not gain this chip.
 Tasks of 30 minutes or less use a compact
-single row with checkbox, an ellipsis title and icon; hover shows the full title
-and metadata. Secondary chips, parent labels and subtask lists are hidden only
-in these compact cards. Their resize grip sits on the right edge to keep the
+single row with checkbox, an ellipsis title, duration chip for Todoist and icon;
+hover shows the full title and metadata. Secondary chips, parent labels and
+subtask lists are hidden only in these compact cards. Their resize grip sits
+on the right edge to keep the
 single row clear, and resizing still changes duration vertically. Larger cards
 keep their bottom resize grip. Calendar block heights still match exact minutes.
 

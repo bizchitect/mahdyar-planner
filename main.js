@@ -9700,6 +9700,27 @@ function cardChips(item, today, ghost) {
   return out;
 }
 
+function renderTaskDurationChip(plugin, item) {
+  if (item.source !== 'todoist') return null;
+  // plannedDuration also holds scheduling fallbacks and local resizes.
+  // Only the sync shadow retains the actual source estimate, in minutes.
+  const shadow = plugin.settings._shadow && plugin.settings._shadow[`todoist:${item.id}`];
+  const duration = plannedDuration(shadow && shadow.duration);
+  const chip = document.createElement('span');
+  chip.className = 'iplan-chip iplan-duration-chip';
+  chip.setAttribute('role', 'img');
+  const durationText = duration == null
+    ? '? min'
+    : duration >= 60
+      ? `${Number((duration / 60).toFixed(2))} h`
+      : `${duration} min`;
+  chip.textContent = durationText;
+  if (duration == null) chip.classList.add('is-missing');
+  chip.title = duration == null ? 'Duration not set' : `Duration: ${durationText}`;
+  chip.setAttribute('aria-label', chip.title);
+  return chip;
+}
+
 // One read-only calendar chip's behavior, shared by the board lanes and the
 // tray's AGENDA tab: stale look while defs come from the vault cache, the
 // feed's lens on the left edge, an aria label, and click-through into the
@@ -9804,6 +9825,8 @@ function renderCard(plugin, item, mode, view) {
   titleRow.className = 'iplan-card-title-row';
   titleRow.appendChild(check);
   titleRow.appendChild(titleEl);
+  const durationChip = renderTaskDurationChip(plugin, item);
+  if (durationChip) titleRow.appendChild(durationChip);
   titleRow.appendChild(sourceMarkEl(item.source));
   bodyEl.appendChild(titleRow);
   if (meta.childNodes.length) bodyEl.appendChild(meta);
@@ -9812,6 +9835,7 @@ function renderCard(plugin, item, mode, view) {
       item.title,
       parent ? `Part of ${parent.title}` : '',
       (SOURCES[item.source] || SOURCES.todoist).label,
+      durationChip ? durationChip.title : '',
       ...chips.map((chip) => chip.label || chip.text),
     ].filter(Boolean).join('\n');
   }
