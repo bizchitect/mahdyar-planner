@@ -237,6 +237,10 @@ button.iplan-sync-btn.is-syncing svg {
 .iplan-board.is-day-calendar .iplan-day-backlog[data-buffer='red'] {
   box-shadow: inset 2px 0 0 var(--color-red);
 }
+.iplan-board.is-weekly-planning .iplan-day[data-buffer='gray'],
+.iplan-board.is-day-calendar .iplan-day-backlog[data-buffer='gray'] {
+  box-shadow: inset 2px 0 0 var(--iplan-dim);
+}
 .iplan-board.is-weekly-planning .iplan-day.is-past { opacity: 1; }
 /* past days: greyed but still a live drop target; hover lifts it back */
 .iplan-day.is-past {

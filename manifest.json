@@ -1,7 +1,7 @@
 {
   "id": "mahdyar-planner",
   "name": "Mahdyar Planner",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "minAppVersion": "1.6.6",
   "description": "Plan your week on one board inside your vault: Todoist, ClickUp, starred email and Google Calendar sync in as markdown notes you drag onto your days, with two-way sync behind explicit toggles.",
   "author": "Mahdyar Sotoudeh",

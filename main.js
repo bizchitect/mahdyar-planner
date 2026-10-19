@@ -1779,7 +1779,8 @@ function dailyPlannedTime(day, settings, events, items, routines) {
       if (duration == null) unknownTasks += 1;
       else plannedMin += duration;
     }
-    const assignedDay = item.plannedDay || item.due;
+    // A due date is not a day assignment; Weekly Backlog keeps due dates and estimates.
+    const assignedDay = item.plannedDay;
     if (!validPlannerDay(assignedDay) || assignedDay !== day) continue;
     if (isOccurrenceTracked(item) && recordedDue.has(item.plannedOccurrenceDue || item.due)) continue;
     if (isOccurrenceTracked(item) && (item.plannedOccurrenceDue || item.plannedStart)
@@ -1861,7 +1862,7 @@ function renderDailyPlannedTime(parent, day, totals, calendars, stale, showDiagn
   ].filter(Boolean).join(' ');
   metric('meetings', 'Meetings', dailyDurationText(totals.meetingsMin), calendarDetail);
   metric('planned', 'Planned', dailyDurationText(totals.plannedMin),
-    `Whole durations of Todoist assignments (due date when no planned day exists) and non-skipped routines, including recorded completed occurrences and assignments outside the day window. ${totals.unknownTasks} tasks or occurrences without duration.`);
+    `Whole durations of Todoist tasks assigned to this day and non-skipped routines, including recorded completed occurrences and assignments outside the day window. ${totals.unknownTasks} tasks or occurrences without duration.`);
   const percentage = totals.bufferPercent == null ? 'N/A' : `${Math.round(totals.bufferPercent * 10) / 10}%`;
   const buffer = metric('buffer', 'Buffer', `${dailyDurationText(totals.bufferMin)} (${percentage})`,
     `Free time: ${dailyDurationText(totals.freeMin)}. Net workday capacity: ${dailyDurationText(totals.dayMin)} (workday end minus start, minus ${dailyDurationText(totals.lunchMin)} of enabled, valid configured lunch within the workday). Meeting durations include any lunch overlap. ${totals.bufferPercent == null ? 'Percentage unavailable because free time is zero.' : 'Percentage of free time after meetings.'} ${totals.freeMin < 0 ? 'Meetings exceed day capacity; a positive ratio does not indicate available time.' : ''}`);
@@ -11577,7 +11578,7 @@ class PlannerBoardView extends ItemView {
         doc.removeEventListener('keydown', escape);
       };
       filters.createDiv({ cls: 'iplan-planning-legend',
-        text: 'Buffer: green >40%, yellow 30-40%, red <30%. Hidden items still count. Visibility resets when this view closes.' });
+        text: 'Buffer: red <20% or negative free time with planned work (overloaded), yellow >=20% and <30% (not badly planned), green 30-40% inclusive (properly planned), gray >40% with non-negative free time or no planned work (not planned). Negative free time overrides percentage bands for planned days. Hidden items still count. Visibility resets when this view closes.' });
     }
 
     /* ---- board ---- */
@@ -11629,12 +11630,14 @@ class PlannerBoardView extends ItemView {
           capacityCalendars.cached.length > 0, !isWeeklyPlanning);
       }
       if (isWeeklyPlanning || dayBacklog) {
-        // Use the computed ratio, not data-quality or assignment gates.
-        // Non-positive free capacity stays red even if its ratio is positive.
-        const level = totals.freeMin <= 0 ? 'red'
-          : totals.dayMin > 0 && Number.isFinite(totals.bufferPercent)
-            ? (totals.bufferPercent > 40 ? 'green' : totals.bufferPercent >= 30 ? 'yellow' : 'red')
-            : 'unknown';
+        // No planned work stays gray; negative free time overrides the computed ratio.
+        const level = totals.plannedMin <= 0 ? 'gray'
+          : totals.freeMin < 0 ? 'red'
+            : Number.isFinite(totals.bufferPercent)
+              ? (totals.bufferPercent < 20 ? 'red'
+                : totals.bufferPercent < 30 ? 'yellow'
+                  : totals.bufferPercent <= 40 ? 'green' : 'gray')
+              : 'unknown';
         if (isWeeklyPlanning) col.dataset.buffer = level;
         if (dayBacklog) dayBacklog.dataset.buffer = level;
       }
