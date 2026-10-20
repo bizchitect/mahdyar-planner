@@ -1717,12 +1717,12 @@ function fmtOpenItems(count) {
   return count === 1 ? '1 OPEN ITEM' : `${count} OPEN ITEMS`;
 }
 
-// Outlook focus blocks stay visible on the calendar, but do not occupy
+// Outlook away and Blocked - Focus time events stay visible on the calendar, but do not occupy
 // meeting capacity. The connector identity is independent of feed names/IDs;
-// generic ICS feeds do not identify their provider and must still count.
+// generic ICS feeds with the same title must still count.
 function countsTowardCapacity(event) {
   const title = trimmed(event && event.title).toLowerCase();
-  return !(title === 'blocked - focus time'
+  return !((title === 'away' || title === 'blocked - focus time')
     && event && event.feedSource === 'outlook-calendar');
 }
 
@@ -4741,8 +4741,9 @@ function plannerToolbarMountPoint(root) {
  * The AI team edits the same fields to move items; the board re-renders live.
  *
  * PLAN-OWNED FIELDS (PLAN_OWNED_ITEM_FIELDS) are the planner's own half of
- * the note. Apart from untouched, unscheduled Todoist duration estimates,
- * a sync run pulls what the source owns and never touches these:
+ * the note. Apart from empty-date Todoist due-day seeds and untouched,
+ * unscheduled duration estimates, a sync run pulls what the source owns
+ * and never touches these:
  * updateItemFile goes through processFrontMatter and assigns by name, so a
  * field it does not name survives every pull by construction. That is a
  * property worth a test rather than a comment, and vault-writes.test.cjs
@@ -4757,7 +4758,8 @@ function plannerToolbarMountPoint(root) {
  * ========================================================================== */
 
 // The fields the planner owns on an item note. Sync pulls the rest and leaves
-// every one of these alone, except a source-owned, unscheduled Todoist estimate.
+// every one of these alone, except an empty-date Todoist due-day seed or
+// source-owned, unscheduled Todoist estimate.
 const PLAN_OWNED_ITEM_FIELDS = [
   'planned_day', 'planned_half', 'planned_order', 'planned_start', 'planned_duration',
   'planned_occurrence_due', 'done_local', 'weekly_goal', 'linked_note',
@@ -5003,6 +5005,8 @@ function scopeAgrees(shadow, scope) {
  * in either direction (a reopen on a recurring task reverts its due date).
  * ========================================================================== */
 
+// User rule: a forward recurring due change counts as completion, including
+// a manual forward reschedule. No external completion evidence is required.
 // Did the source's due move forward past the baseline? Unknown recurrence
 // (an older note, or ClickUp) counts as recurring: the rule keys on the due
 // having MOVED while a baseline existed, which a one-off task's edit also
@@ -5041,6 +5045,13 @@ function syncCompletionPlan({ prior, sourceItem, shadow, completeOnSource, recur
     clearReopenPending: prior.reopenPending === true,
     resetChildrenDoneLocal: false,
   };
+  // Existing durable note identity also repairs a stale settings shadow.
+  if (prior.source === 'todoist' && shadow && shadow.due
+    && prior.due === sourceItem.due
+    && ((prior.lastCompletedDue && prior.lastCompletedDue >= shadow.due)
+      || (prior.occurrences || []).some((o) => o.due === shadow.due))) {
+    return { ...base, nextShadowDone: false };
+  }
   if (occurrenceAdvanced(prior, sourceItem, shadow)) {
     const mode = recurringAdvance === 'drop' ? 'drop' : 'move';
     // A plan on or after the new due was made for the NEXT occurrence and
@@ -5051,9 +5062,14 @@ function syncCompletionPlan({ prior, sourceItem, shadow, completeOnSource, recur
       && prior.plannedOccurrenceDue === sourceItem.due;
     const staleTimedPlan = timedPlan && isOccurrenceTracked(prior) && !timedPlanForNext;
     const plannedBefore = !!(prior.plannedDay && prior.plannedDay < sourceItem.due);
-    const occurrenceDay = plannedBefore ? prior.plannedDay
-      : (!prior.plannedDay && plannedDuration(prior.plannedDuration) != null
-        && validPlannerDay(shadow.due) ? shadow.due : null);
+    // A Todoist occurrence owns its execution day, even after the next due.
+    // An explicit binding wins over chronological guesses about that day.
+    const todoistOldPlan = prior.source === 'todoist' && prior.plannedDay
+      && (!prior.plannedOccurrenceDue || prior.plannedOccurrenceDue === shadow.due);
+    const occurrenceDay = prior.source === 'todoist' ? (todoistOldPlan ? prior.plannedDay : null)
+      : (plannedBefore ? prior.plannedDay
+        : (!prior.plannedDay && plannedDuration(prior.plannedDuration) != null
+          && validPlannerDay(shadow.due) ? shadow.due : null));
     return {
       ...base,
       advanced: true,
@@ -5063,8 +5079,8 @@ function syncCompletionPlan({ prior, sourceItem, shadow, completeOnSource, recur
       occurrence: {
         due: shadow.due,
         plannedDay: occurrenceDay,
-        plannedHalf: plannedBefore ? (prior.plannedHalf || null) : null,
-        ...(occurrenceDay && (!isOccurrenceTracked(prior)
+        plannedHalf: occurrenceDay ? (prior.plannedHalf || null) : null,
+        ...(occurrenceDay && (todoistOldPlan || !isOccurrenceTracked(prior)
           || (!prior.plannedOccurrenceDue && !prior.plannedStart)
           || prior.plannedOccurrenceDue === shadow.due)
           && plannedDuration(prior.plannedDuration) != null
@@ -5166,7 +5182,10 @@ const SYNC_WRITE_MAX_PATHS = 500;
 const OCCURRENCE_CAP = 30;
 function appendOccurrence(list, occurrence, cap) {
   const max = Number.isFinite(cap) && cap > 0 ? cap : OCCURRENCE_CAP;
-  const out = (Array.isArray(list) ? list : []).concat([occurrence]);
+  const rows = Array.isArray(list) ? list : [];
+  // Within one task note, due identifies an occurrence, not its execution day.
+  if (occurrence.due && rows.some((row) => row.due === occurrence.due)) return rows;
+  const out = rows.concat([occurrence]);
   return out.length > max ? out.slice(out.length - max) : out;
 }
 
@@ -7971,6 +7990,7 @@ class IcorPlannerPlugin extends Plugin {
     this.syncing = true;
     this.emitModelChanged();
     try {
+      delete this.syncStatus.planner;
       // One confirming GET per absent task per sync, not per code path.
       this._goneProbed = new Set();
       await this.ensureFolders();
@@ -7987,7 +8007,18 @@ class IcorPlannerPlugin extends Plugin {
           warning: result.warning || null, complete: result.complete !== false,
           count: result.items.length, at: new Date().toISOString(),
         };
-        if (result.ok) await this.upsertSource(source, result);
+        if (result.ok) {
+          try {
+            await this.upsertSource(source, result);
+          } catch (error) {
+            // Earlier items may be saved; the failed item's shadow is assigned
+            // only after its note write, preserving its old retry baseline.
+            this.syncStatus[source] = { ...this.syncStatus[source], ok: false,
+              reason: 'deferred', complete: false,
+              message: 'Source sync partially applied. Refresh Planner and sync again.' };
+            new Notice(`Planner: ${SOURCES[source].label} sync deferred. Earlier changes may be saved. Refresh Planner and sync again.`, 12000);
+          }
+        }
       }
       // A sync the user pressed for, with a source misconfigured: say what
       // went wrong and what to do about it, once, here, not only in the tray.
@@ -8027,8 +8058,14 @@ class IcorPlannerPlugin extends Plugin {
       await this.persistSettings(); // persist the refreshed shadows
       if (manual) {
         const okCount = SYNCED_SOURCES.filter((k) => this.syncStatus[k] && this.syncStatus[k].ok).length;
-        new Notice(`Planner sync done (${okCount} task source${okCount === 1 ? '' : 's'} healthy).`);
+        const deferred = SYNCED_SOURCES.some((k) => this.syncStatus[k] && this.syncStatus[k].reason === 'deferred');
+        new Notice(`Planner sync ${deferred ? 'partially applied; refresh and retry' : 'done'} (${okCount} task source${okCount === 1 ? '' : 's'} healthy).`);
       }
+    } catch (error) {
+      this.syncStatus.planner = { ok: false, reason: 'deferred', complete: false,
+        message: 'Sync stopped before finishing. Earlier changes may be saved. Sync again.',
+        at: new Date().toISOString() };
+      new Notice('Planner: sync did not finish. Earlier changes may be saved; refresh Planner and sync again.', 12000);
     } finally {
       this.syncing = false;
       this.emitModelChanged();
@@ -8128,8 +8165,14 @@ class IcorPlannerPlugin extends Plugin {
       // pending close is retried at sync time too. A reopen is never decided
       // here - the item is in the source's open set, so the source already
       // says open, and the source is the winner.
+      // If the note committed an advance before settings were saved, its
+      // durable due/marker is the completion baseline for subsequent advances.
+      const completionShadow = source === 'todoist' && shadow && shadow.due
+        && prior.lastCompletedDue && prior.lastCompletedDue >= shadow.due
+        && validPlannerDay(prior.due) && prior.due > shadow.due
+        ? { ...shadow, due: prior.due, done: false } : shadow;
       const plan = syncCompletionPlan({
-        prior, sourceItem: t, shadow,
+        prior, sourceItem: t, shadow: completionShadow,
         completeOnSource: !!s.completeOnSource,
         recurringAdvance: s.recurringAdvance,
       });
@@ -8149,7 +8192,7 @@ class IcorPlannerPlugin extends Plugin {
       // the probe compares against is never older than the last sync.
       if (uidValidity) nextShadow.uidvalidity = uidValidity;
       if (t.messageId) nextShadow.messageId = t.messageId;
-      const durationOwned = await this.updateItemFile(prior, t, finals, body, plan, shadow);
+      const durationOwned = await this.updateItemFile(prior, t, finals, body, plan, shadow, completionShadow);
       if (source === 'todoist') {
         nextShadow.duration = plannedDuration(t.duration);
         nextShadow.durationOwned = durationOwned;
@@ -8627,7 +8670,9 @@ class IcorPlannerPlugin extends Plugin {
       `parent_id: ${t.parentId ? JSON.stringify(String(t.parentId)) : null}`,
       `recurring: ${t.recurring == null ? null : !!t.recurring}`,
       `due_string: ${t.dueString ? JSON.stringify(String(t.dueString)) : null}`,
-      'planned_day: null',
+      `planned_day: ${source === 'todoist' && validPlannerDay(t.due) ? t.due : null}`,
+      ...(source === 'todoist' && t.recurring !== false && validPlannerDay(t.due)
+        ? [`planned_occurrence_due: ${t.due}`] : []),
       'planned_half: null',
       'planned_order: 0',
       ...(source === 'todoist' && plannedDuration(t.duration) != null
@@ -8654,14 +8699,15 @@ class IcorPlannerPlugin extends Plugin {
   // (due / priority / description); source-owned metadata always pulls.
   //
   // Every write below names its field. Planner-owned placement fields are not
-  // assigned by a source refresh, except an untouched, unscheduled Todoist
-  // duration estimate; processFrontMatter preserves fields it does
-  // not name. The `ops` block below is the plan acting on itself when a
-  // finished occurrence clears its own placement, never the source reaching in.
+  // assigned by a source refresh, except an empty-date Todoist due-day seed or
+  // untouched, unscheduled duration estimate; processFrontMatter preserves
+  // fields it does not name. An occurrence advance archives the old plan;
+  // Todoist seeds a separate new occurrence unless it already has a plan.
+  // Ordinary pulls never replace the current occurrence's Planner date.
   // `plan` (optional) is the syncCompletionPlan result: the occurrence
   // advance and the reopen confirmation are applied to the note here, in the
   // same frontmatter write as the source pull.
-  async updateItemFile(prior, t, finals, currentBody, plan, shadow) {
+  async updateItemFile(prior, t, finals, currentBody, plan, shadow, completionShadow = shadow) {
     // `title` is a shared field since 0.15.0, so the settled value wins here
     // the way `due` and `priority` already did. An empty settled title falls
     // back to the source's: the note never blanks a task's name.
@@ -8672,6 +8718,8 @@ class IcorPlannerPlugin extends Plugin {
     const wantDueString = t.dueString ? String(t.dueString) : null;
     const wantParent = t.parentId ? String(t.parentId) : null;
     const ops = plan || {};
+    const seedPlannedDay = prior.source === 'todoist' && validPlannerDay(t.due)
+      ? t.due : null;
     const durationPlan = todoistDurationPlan(prior, t, shadow);
     let durationOwned = durationPlan ? durationPlan.owned : false;
     const hasOps = !!(ops.resetDoneLocal || ops.clearPlan || ops.movePlan || ops.occurrence || ops.clearReopenPending);
@@ -8681,13 +8729,42 @@ class IcorPlannerPlugin extends Plugin {
       prior.status === 'done' || // reopened at the source
       prior.recurring !== wantRecurring || prior.dueString !== wantDueString ||
       prior.parentId !== wantParent ||
-      hasOps || !!(durationPlan && durationPlan.changed) ||
+      hasOps || !!(seedPlannedDay && !prior.plannedDay) || !!(durationPlan && durationPlan.changed) ||
       JSON.stringify(prior.tags) !== JSON.stringify(t.tags || []) ||
       prior.sourceStatus !== (t.status || null) ||
       prior.listId !== (t.listId ? String(t.listId) : null);
     if (changed) {
       const nowIso = new Date().toISOString();
       await this.app.fileManager.processFrontMatter(prior.file, (fm) => {
+        // Read placement before pulling source fields. A concurrent manual plan
+        // is not the old snapshot's placement, and must not be cleared or archived.
+        const current = itemFromFrontmatter(fm, prior.path, prior.file.basename);
+        // Archive identity and placement transition share the same note write.
+        // A stale cache/shadow must not clear the new active placement.
+        const replay = prior.source === 'todoist' && ops.advanced && current
+          && completionShadow && completionShadow.due
+          && ((current.lastCompletedDue && current.lastCompletedDue >= completionShadow.due)
+            || current.occurrences.some((o) => o.due === completionShadow.due));
+        if (replay) {
+          if (current.due !== t.due) {
+            throw new Error('Planner recurrence baseline changed. Refresh and sync again.');
+          }
+          ops.resetChildrenDoneLocal = false;
+          return;
+        }
+        const placementChanged = current && ['plannedDay', 'plannedHalf', 'plannedOrder',
+          'plannedStart', 'plannedDuration', 'plannedOccurrenceDue']
+          .some((field) => current[field] !== prior[field]);
+        const todoistAdvance = prior.source === 'todoist' && ops.advanced;
+        const nextOccurrencePlan = todoistAdvance && current && current.plannedDay
+          && current.plannedOccurrenceDue === t.due;
+        // Without a new-occurrence binding a concurrent edit is ambiguous.
+        // Retry from a fresh snapshot instead of clearing it or guessing ownership.
+        if (todoistAdvance && (!current || (placementChanged && !nextOccurrencePlan))) {
+          throw new Error('Planner placement changed during recurrence sync. Sync again to retry.');
+        }
+        const historyOps = todoistAdvance && current && !placementChanged
+          ? syncCompletionPlan({ prior: current, sourceItem: t, shadow: completionShadow }) : ops;
         fm.title = wantTitle;
         fm.due = wantDue;
         fm.priority = wantPriority;
@@ -8718,34 +8795,49 @@ class IcorPlannerPlugin extends Plugin {
         if (fm.status === 'done') { fm.status = 'open'; delete fm.done_at; fm.done_local = false; }
         if (ops.clearReopenPending) delete fm.reopen_pending;
         if (ops.resetDoneLocal) { fm.done_local = false; fm.status = 'open'; delete fm.done_at; }
-        if (ops.clearPlan) {
-          fm.planned_day = null;
-          fm.planned_half = null;
-          fm.planned_order = 0;
-          delete fm.planned_start;
-          delete fm.planned_duration;
-          delete fm.planned_occurrence_due;
-          // The old timed occurrence was deliberately cleared. Seed the next
-          // occurrence's estimate without changing the recorded old duration.
-          if (prior.source === 'todoist') {
+        if (todoistAdvance) {
+          if (!nextOccurrencePlan) {
+            // The old occurrence stays in history; none of its timing or
+            // duration belongs to the new occurrence sharing this task ID.
+            fm.planned_day = null;
+            fm.planned_half = null;
+            fm.planned_order = 0;
+            delete fm.planned_start;
+            delete fm.planned_occurrence_due;
+            delete fm.planned_duration;
             if (plannedDuration(t.duration) != null) fm.planned_duration = t.duration;
             durationOwned = true;
           }
+        } else if (prior.source !== 'todoist') {
+          if (ops.clearPlan) {
+            fm.planned_day = null;
+            fm.planned_half = null;
+            fm.planned_order = 0;
+            delete fm.planned_start;
+            delete fm.planned_duration;
+            delete fm.planned_occurrence_due;
+          }
+          if (ops.movePlan) {
+            fm.planned_day = ops.movePlan.day;
+            fm.planned_half = ops.movePlan.half;
+            fm.planned_order = Date.now();
+          }
         }
-        if (ops.movePlan) {
-          // Appended at the end of the lane: the tap-to-plan convention
-          // (order = wall-clock ms, past every hand order).
-          fm.planned_day = ops.movePlan.day;
-          fm.planned_half = ops.movePlan.half;
-          fm.planned_order = Date.now();
+        // Empty means seed again, not a tombstone. Bind the seed to this
+        // occurrence so a later advance can distinguish it from a new plan.
+        if (seedPlannedDay && !fm.planned_day) {
+          fm.planned_day = seedPlannedDay;
+          delete fm.planned_start;
+          if (wantRecurring !== false) fm.planned_occurrence_due = t.due;
+          else delete fm.planned_occurrence_due;
         }
-        if (ops.occurrence) {
+        if (historyOps.occurrence) {
           fm.occurrences = appendOccurrence(fm.occurrences, {
-            due: ops.occurrence.due,
-            planned_day: ops.occurrence.plannedDay,
-            planned_half: ops.occurrence.plannedHalf,
-            ...(plannedDuration(ops.occurrence.plannedDuration) != null
-              ? { planned_duration: ops.occurrence.plannedDuration } : {}),
+            due: historyOps.occurrence.due,
+            planned_day: historyOps.occurrence.plannedDay,
+            planned_half: historyOps.occurrence.plannedHalf,
+            ...(plannedDuration(historyOps.occurrence.plannedDuration) != null
+              ? { planned_duration: historyOps.occurrence.plannedDuration } : {}),
             done_at: nowIso,
           });
           fm.last_completed_due = ops.lastCompletedDue;
@@ -8781,25 +8873,44 @@ class IcorPlannerPlugin extends Plugin {
     this._shadowSaveTimer = window.setTimeout(() => this.persistSettings(), 1500);
   }
 
-  async assignItem(path, day, half, order, untimed = false) {
+  // Validate rendered action identity, due, completion and expected placement.
+  assertPlacementCurrent(fm, file, expected) {
+    const current = itemFromFrontmatter(fm, file.path, file.basename);
+    const keys = ['source', 'id', 'due', 'recurring', 'status', 'doneLocal',
+      'reopenPending', 'lastCompletedDue', 'plannedDay', 'plannedHalf',
+      'plannedOrder', 'plannedStart', 'plannedDuration', 'plannedOccurrenceDue'];
+    if (!current || !expected || expected.path !== file.path || isDone(current)
+      || keys.some((key) => current[key] !== expected[key])) {
+      throw new Error('Task changed since this action began. Refresh Planner and try again.');
+    }
+    return current;
+  }
+
+  async assignItem(path, day, half, order, untimed = false, expected = this._dragPlacement) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return false;
-    await this.app.fileManager.processFrontMatter(file, (fm) => {
-      if (untimed) {
-        // This entry point only takes unplanned backlog tasks. Recheck the
-        // actual note so a stale drag cannot overwrite a newer plan or done.
-        const current = itemFromFrontmatter(fm, path, file.basename);
-        if (!validPlannerDay(day) || !current || isDone(current) || current.plannedDay) {
-          throw new Error('Task is no longer an unfinished, unplanned backlog item.');
+    try {
+      await this.app.fileManager.processFrontMatter(file, (fm) => {
+        this.assertPlacementCurrent(fm, file, expected);
+        if (untimed) {
+          // This entry point only takes unplanned backlog tasks. Recheck the
+          // actual note so a stale drag cannot overwrite a newer plan or done.
+          const current = itemFromFrontmatter(fm, path, file.basename);
+          if (!validPlannerDay(day) || !current || isDone(current) || current.plannedDay) {
+            throw new Error('Task is no longer an unfinished, unplanned backlog item.');
+          }
+          delete fm.planned_start;
+          delete fm.planned_occurrence_due;
         }
-        delete fm.planned_start;
-        delete fm.planned_occurrence_due;
-      }
-      fm.planned_day = day;
-      fm.planned_half = half;
-      fm.planned_order = order;
-      this.claimTodoistDuration(fm);
-    });
+        fm.planned_day = day;
+        fm.planned_half = half;
+        fm.planned_order = order;
+        this.claimTodoistDuration(fm);
+      });
+    } catch (error) {
+      new Notice('Planner: task changed. Refresh Planner and retry the move.');
+      return false;
+    }
     return true;
   }
 
@@ -8828,6 +8939,7 @@ class IcorPlannerPlugin extends Plugin {
     }
     try {
       await this.app.fileManager.processFrontMatter(file, (fm) => {
+        this.assertPlacementCurrent(fm, file, item);
         fm.planned_day = day;
         fm.planned_start = start;
         fm.planned_duration = requestedDuration;
@@ -8837,7 +8949,7 @@ class IcorPlannerPlugin extends Plugin {
       });
     } catch (error) {
       console.error('icor-planner: could not schedule task', path, error);
-      new Notice('Planner: the task could not be scheduled. Check the task note and try again.');
+      new Notice('Planner: task changed or could not be scheduled. Refresh Planner and try again.');
       return false;
     }
     this.emitModelChanged();
@@ -8845,6 +8957,7 @@ class IcorPlannerPlugin extends Plugin {
   }
 
   async placeInDayBacklog(path, day, half, order, expected, reranks = [], snapshot = []) {
+    const dragExpected = this._dragPlacement;
     if (this._dayBacklogSaving) {
       new Notice('Planner: another Today Backlog save is still in progress. Try again when it finishes.');
       return false;
@@ -8913,6 +9026,7 @@ class IcorPlannerPlugin extends Plugin {
       await this.app.fileManager.processFrontMatter(file, (fm) => {
         guardMembership();
         const current = itemFromFrontmatter(fm, path, file.basename);
+        if (dragExpected) this.assertPlacementCurrent(fm, file, dragExpected);
         // Check again inside the write, not just against the rendered card.
         // A stale drag must not move a newer plan or reopen a completed task.
         if (!validPlannerDay(day) || !current || isDone(current) || !expected
@@ -8941,7 +9055,7 @@ class IcorPlannerPlugin extends Plugin {
     return true;
   }
 
-  async unassignItem(path, retainDay = false) {
+  async unassignItem(path, retainDay = false, expected = this._dragPlacement) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice('Planner: the task note could not be found. Refresh the view before returning it to the backlog.');
@@ -8949,6 +9063,7 @@ class IcorPlannerPlugin extends Plugin {
     }
     try {
       await this.app.fileManager.processFrontMatter(file, (fm) => {
+        this.assertPlacementCurrent(fm, file, expected);
         if (retainDay) {
           // Keep the weekly lane and hand order; only infer a missing half.
           const start = plannedStartMinute(fm.planned_start);
@@ -8967,7 +9082,7 @@ class IcorPlannerPlugin extends Plugin {
       });
     } catch (error) {
       console.error('icor-planner: could not return task to backlog', path, error);
-      new Notice('Planner: the task could not be returned to the backlog. Check the task note and try again.');
+      new Notice('Planner: task changed or could not be returned to the backlog. Refresh Planner and try again.');
       return false;
     }
     this.emitModelChanged();
@@ -9764,12 +9879,14 @@ function renderCard(plugin, item, mode, view) {
 
   if (!ghost) {
     card.addEventListener('dragstart', (e) => {
+      plugin._dragPlacement = { ...item };
       e.dataTransfer.setData('text/plain', item.path);
       e.dataTransfer.effectAllowed = 'move';
       card.classList.add('is-dragging');
       document.body.classList.add('iplan-dragging');
     });
     card.addEventListener('dragend', () => {
+      plugin._dragPlacement = null;
       card.classList.remove('is-dragging');
       document.body.classList.remove('iplan-dragging');
       document.querySelectorAll('.iplan-drop-line').forEach((el) => el.remove());
@@ -10274,11 +10391,11 @@ function showCardMenu(plugin, item, view, pos) {
     .setIcon('calendar').onClick(() => showPlanMenu(plugin, item, view, pos)));
   if (activeTimedPlacement(item)) {
     menu.addItem((mi) => mi.setTitle('Send to Today Backlog')
-      .setIcon('calendar-minus').onClick(() => plugin.unassignItem(item.path, true)));
+      .setIcon('calendar-minus').onClick(() => plugin.unassignItem(item.path, true, item)));
   }
   if (item.plannedDay) {
     menu.addItem((mi) => mi.setTitle('Send to Weekly Backlog')
-      .setIcon('inbox').onClick(() => plugin.unassignItem(item.path)));
+      .setIcon('inbox').onClick(() => plugin.unassignItem(item.path, false, item)));
   }
   if (item.url) {
     menu.addItem((mi) => mi.setTitle(`Open in ${(SOURCES[item.source] || {}).label || item.source}`)
@@ -10558,15 +10675,30 @@ function wireTimedTaskResize(plugin, item, card, view) {
   const placement = activeTimedPlacement(item);
   if (!placement) return;
   const focusKey = `resize:task:${item.path}:${placement.day}`;
+  // Preview mutates the layout model, never the expected persisted placement.
+  // Replace this snapshot only after a successful save, for repeated key presses.
+  let persisted = Object.freeze({ ...item });
   const handle = wireTimedResize(card, view, placement, {
+    restoreOnFailure: true,
     label: `Duration for ${item.title}`,
     preview: (duration) => {
       item.plannedDuration = duration;
       card.classList.toggle('is-compact', duration <= TIMED_TASK_COMPACT_MINUTES);
     },
-    save: (duration) => {
+    save: async (duration) => {
       if (view) view.pendingPlanFocus = focusKey;
-      return plugin.assignTimedItem(item.path, placement.day, plannedStartText(placement.start), duration, item);
+      const saved = await plugin.assignTimedItem(item.path, placement.day,
+        plannedStartText(placement.start), duration, persisted);
+      if (saved) {
+        persisted = Object.freeze({ ...persisted, plannedDuration: duration,
+          plannedStart: plannedStartText(placement.start),
+          plannedOccurrenceDue: isOccurrenceTracked(persisted) ? persisted.due : null });
+      } else {
+        // The shared resize restores its preview; reload the live model too,
+        // since rejection may mean sync advanced to another occurrence.
+        plugin.emitModelChanged();
+      }
+      return saved;
     },
   });
   handle.setAttribute('data-plan-focus', focusKey);
@@ -10577,6 +10709,8 @@ function wireTimedTaskResize(plugin, item, card, view) {
 function wireTimedResize(card, view, placement, options) {
   let duration = placement.duration;
   let pointerResizeActive = false;
+  let savePending = false;
+  let persistedDuration = duration;
   const stepMinutes = options.stepMinutes ?? PLANNER_SLOT_MINUTES;
   const maximumDuration = 1440 - placement.start;
   const minimumDuration = Math.min(options.minimumDuration ?? PLANNER_SLOT_MINUTES, duration, maximumDuration);
@@ -10595,13 +10729,27 @@ function wireTimedResize(card, view, placement, options) {
     handle.title = `${duration} minutes`;
     options.preview(duration);
     if (persist) {
-      options.save(duration);
+      if (options.restoreOnFailure) {
+        const requested = duration;
+        savePending = true;
+        Promise.resolve().then(() => options.save(requested)).then((saved) => {
+          if (saved === false) update(persistedDuration, false);
+          else persistedDuration = requested;
+        }).catch(() => {
+          update(persistedDuration, false);
+        }).finally(() => {
+          savePending = false;
+          if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
+        });
+      } else {
+        options.save(duration);
+      }
       if (view && typeof view.relayoutTimedGrid === 'function') view.relayoutTimedGrid(placement.day);
     }
   };
   update(duration, false);
   handle.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0 || pointerResizeActive) return;
+    if (event.button !== 0 || pointerResizeActive || savePending) return;
     event.preventDefault();
     event.stopPropagation();
     if (view && view.cancelDailyMove) view.cancelDailyMove();
@@ -10654,7 +10802,7 @@ function wireTimedResize(card, view, placement, options) {
     if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown' && event.key !== 'Home' && event.key !== 'End') return;
     event.preventDefault();
     event.stopPropagation();
-    if (pointerResizeActive) return;
+    if (pointerResizeActive || savePending) return;
     let nextDuration;
     if (event.key === 'Home') {
       nextDuration = Number(handle.getAttribute('aria-valuemin'));
@@ -11686,6 +11834,9 @@ class PlannerBoardView extends ItemView {
           && (weekdays.length === 4 || weekdays.includes('fri'));
         return this.showPlanningDailyRoutines || !daily;
       });
+      // Date-only assignments have no AM/PM lane yet. Weekly Goals are a
+      // parallel tray view of the same notes, not an exclusion from this day.
+      if (!dayBacklog) this.renderDateOnlyBacklog(day, col, items);
       if (isCalendar) {
         if (!isDay) this.renderUntimedTasks(day, col, items);
         this.renderTimedGrid(day, col, items, events, routines);
@@ -11955,6 +12106,16 @@ class PlannerBoardView extends ItemView {
     return section;
   }
 
+  renderDateOnlyBacklog(day, col, items) {
+    const tasks = (items || []).filter((item) => isDayBacklogItem(item, day)
+      && !isUntimedHalfDayItem(item, day)).sort(compareDayBacklogItems);
+    if (!tasks.length) return;
+    const section = col.createDiv({ cls: 'iplan-time-untimed',
+      attr: { 'aria-label': `Day Backlog for ${day}` } });
+    section.createDiv({ cls: 'iplan-time-untimed-title', text: 'DAY BACKLOG' });
+    for (const item of tasks) section.appendChild(renderCard(this.plugin, item, 'board', this));
+  }
+
   renderUntimedTasks(day, col, items) {
     const tasks = (items || []).filter((item) => isUntimedHalfDayItem(item, day));
     if (!tasks.length) return;
@@ -12168,7 +12329,7 @@ class PlannerBoardView extends ItemView {
     });
     wireTimedDrop(slots, grid, (path, start) => {
       const item = items.find((candidate) => candidate.path === path);
-      if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start), null, item);
+      if (item) this.plugin.assignTimedItem(path, day, plannedStartText(start), null, this.plugin._dragPlacement || item);
     });
     this.relayoutTimedGrid(day);
 
@@ -12643,7 +12804,8 @@ function compareDayBacklogItems(a, b) {
 function isUntimedHalfDayItem(item, day) {
   return !!item && item.plannedDay === day
     && (item.plannedHalf === 'am' || item.plannedHalf === 'pm')
-    && !item.plannedOccurrenceDue
+    && (!item.plannedOccurrenceDue
+      || (item.source === 'todoist' && item.plannedOccurrenceDue === item.due))
     && (!item.plannedStart || item.plannedDuration == null)
     && !activeTimedPlacement(item);
 }
