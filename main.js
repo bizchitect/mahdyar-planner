@@ -8880,7 +8880,8 @@ class IcorPlannerPlugin extends Plugin {
       'reopenPending', 'lastCompletedDue', 'plannedDay', 'plannedHalf',
       'plannedOrder', 'plannedStart', 'plannedDuration', 'plannedOccurrenceDue'];
     if (!current || !expected || expected.path !== file.path || isDone(current)
-      || keys.some((key) => current[key] !== expected[key])) {
+      || keys.some((key) => current[key] !== (key === 'plannedOrder' && expected.noteOrder != null
+        ? expected.noteOrder : expected[key]))) {
       throw new Error('Task changed since this action began. Refresh Planner and try again.');
     }
     return current;
@@ -12829,7 +12830,8 @@ function agendaSections(items, events, today, routineOccs, splitTime) {
     const placement = activeTimedPlacement(it);
     if (placement && placement.day === today) {
       const half = routineHalf(placement.start, splitTime || '13:00');
-      taskHalf[half].push({ ...it, plannedOrder: placement.start });
+      // Display copy sorts by start minute; noteOrder keeps the note's real planned_order for drag checks.
+      taskHalf[half].push({ ...it, plannedOrder: placement.start, noteOrder: it.plannedOrder });
     } else if (!placement && isUntimedHalfDayItem(it, today)) {
       taskHalf[it.plannedHalf].push(it);
     }
